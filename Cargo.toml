@@ -1,0 +1,35 @@
+[package]
+name = "custom_shell"
+version = "0.1.0"
+edition = "2021"
+
+authors = ["Der"]
+
+description = "A custom shell in Rust"
+
+[dependencies]
+rustyline = { version = "12", optional = true }
+log = { version = "0.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+signal-hook = { version = "0.3", optional = true }
+libc = { version = "0.2", optional = true }
+glob = { version = "0.3", optional = true }
+nix = { version = "0.28", default-features = false, features = ["term", "process", "signal"], optional = true }
+
+[features]
+default = ["shell"]
+expansion = ["glob"]
+shell = ["expansion", "rustyline", "signal-hook", "libc", "nix", "log", "env_logger"]
+pty-tests = []
+
+[[bin]]
+name = "custom_shell"
+path = "src/main.rs"
+required-features = ["shell"]
+
+[dev-dependencies]
+portable-pty = "0.8"
+serial_test = "2"
+anyhow = "1"
+tempfile = "3"
+proptest = "1"

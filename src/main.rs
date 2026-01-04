@@ -1,0 +1,420 @@
+use rustyline::{Config, EditMode, Editor};
+use rustyline::history::DefaultHistory;
+use signal_hook::consts::signal::SIGCHLD;
+use signal_hook::flag;
+use std::collections::HashMap;
+use std::env;
+use std::io;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicI32, Ordering},
+};
+
+mod builtins;
+mod completion;
+mod config;
+mod execution;
+mod expansion;
+mod heredoc;
+mod io_helpers;
+mod job_control;
+mod parse;
+mod signals;
+mod utils;
+
+use builtins::{execute_builtin, execute_builtin_substitution, is_builtin, try_execute_compound};
+use completion::LineHelper;
+use config::{apply_aliases, build_prompt, load_config};
+use execution::{
+    build_command, run_pipeline, run_pipeline_capture, spawn_command_background,
+    spawn_pipeline_background, status_from_error,
+};
+use expansion::{ExpansionContext, expand_globs, expand_tokens};
+use io_helpers::{normalize_command_output, read_input_line};
+use job_control::{Job, JobStatus, WaitOutcome, add_job_with_status, reap_jobs};
+use signals::{init_session, install_signal_handlers};
+
+use parse::{CommandSpec, SeqOp, parse_line, split_pipeline, split_sequence};
+
+fn main() {
+    init_logging();
+    let fg_pgid = Arc::new(AtomicI32::new(0));
+    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    if let Err(err) = install_signal_handlers() {
+        eprintln!("error: {err}");
+        return;
+    }
+    let shell_pgid = match init_session() {
+        Ok(pgid) => pgid,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return;
+        }
+    };
+    let edit_mode = match env::var("MINISHELL_EDITMODE").ok().as_deref() {
+        Some("vi") | Some("VI") => EditMode::Vi,
+        _ => EditMode::Emacs,
+    };
+    let config = Config::builder()
+        .auto_add_history(true)
+        .edit_mode(edit_mode)
+        .build();
+    let mut editor = match Editor::with_config(config) {
+        Ok(editor) => editor,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return;
+        }
+    };
+    editor.set_helper(Some(LineHelper::new()));
+
+    let mut state = ShellState {
+        editor,
+        fg_pgid,
+        sigchld_flag: Arc::new(AtomicBool::new(false)),
+        shell_pgid,
+        aliases: HashMap::new(),
+        prompt_template: None,
+        functions: HashMap::new(),
+        jobs: Vec::new(),
+        next_job_id: 1,
+        last_status: 0,
+        pipefail: false,
+        interactive,
+        trace: false,
+    };
+    for arg in env::args().skip(1) {
+        if arg == "-x" {
+            state.trace = true;
+        }
+    }
+    if let Err(err) = load_config(&mut state.aliases, &mut state.prompt_template) {
+        eprintln!("config error: {err}");
+    }
+    if let Err(err) = flag::register(SIGCHLD, Arc::clone(&state.sigchld_flag)) {
+        eprintln!("error: {err}");
+        return;
+    }
+
+    loop {
+        if let Err(err) = run_once(&mut state) {
+            eprintln!("error: {err}");
+        }
+    }
+}
+
+fn init_logging() {
+    let env = env_logger::Env::default().filter_or("MINISHELL_LOG", "info");
+    let _ = env_logger::Builder::from_env(env)
+        .format_timestamp_millis()
+        .try_init();
+}
+
+fn run_once(state: &mut ShellState) -> io::Result<()> {
+    if state.sigchld_flag.swap(false, Ordering::SeqCst) {
+        reap_jobs(&mut state.jobs);
+    }
+    reap_jobs(&mut state.jobs);
+    if state.interactive {
+        completion::update_completion_context(
+            &mut state.editor,
+            &state.aliases,
+            &state.functions,
+            &state.jobs,
+        );
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| "/".into());
+    let prompt = build_prompt(
+        state.interactive,
+        &state.prompt_template,
+        state.last_status,
+        &cwd,
+    );
+
+    let line = match read_input_line(&mut state.editor, state.interactive, &prompt)? {
+        Some(line) => line,
+        None => {
+            if state.interactive {
+                println!();
+            }
+            std::process::exit(0);
+        }
+    };
+
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let tokens = match parse_line(trimmed) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("parse error: {msg}");
+            state.last_status = 2;
+            return Ok(());
+        }
+    };
+    trace_tokens(state, "parsed tokens", &tokens);
+
+    if tokens.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(handled) = try_execute_compound(state, &tokens, trimmed)? {
+        if handled {
+            return Ok(());
+        }
+    }
+
+    let ctx = build_expansion_context(Arc::clone(&state.fg_pgid), state.trace);
+    let expanded = match expand_tokens(tokens, &ctx) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("parse error: {msg}");
+            state.last_status = 2;
+            return Ok(());
+        }
+    };
+    trace_tokens(state, "expanded tokens", &expanded);
+
+    if expanded.is_empty() {
+        return Ok(());
+    }
+
+    let expanded = match expand_globs(expanded) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("parse error: {msg}");
+            state.last_status = 2;
+            return Ok(());
+        }
+    };
+    trace_tokens(state, "globbed tokens", &expanded);
+
+    if expanded.is_empty() {
+        return Ok(());
+    }
+
+    let segments = match split_sequence(expanded) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("parse error: {msg}");
+            state.last_status = 2;
+            return Ok(());
+        }
+    };
+
+    for segment in segments {
+        let should_run = match segment.op {
+            SeqOp::Always => true,
+            SeqOp::And => state.last_status == 0,
+            SeqOp::Or => state.last_status != 0,
+        };
+        if should_run {
+            execute_segment(state, segment.tokens, &segment.display)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn execute_segment(
+    state: &mut ShellState,
+    tokens: Vec<String>,
+    display: &str,
+) -> io::Result<()> {
+    let tokens = apply_aliases(tokens, &state.aliases);
+    trace_tokens(state, "segment tokens", &tokens);
+    let (mut pipeline, background) = match split_pipeline(tokens) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("parse error: {msg}");
+            state.last_status = 2;
+            return Ok(());
+        }
+    };
+    if let Err(msg) = heredoc::fill_heredocs(&mut pipeline, state.interactive, &mut state.editor) {
+        eprintln!("parse error: {msg}");
+        state.last_status = 2;
+        return Ok(());
+    }
+    trace_command_specs(state, &pipeline);
+
+    if background {
+        if pipeline
+            .iter()
+            .any(|cmd| is_builtin(cmd.args.first().map(String::as_str)))
+        {
+            eprintln!("background jobs only work with external commands");
+            state.last_status = 2;
+            return Ok(());
+        }
+        let job_count = pipeline.len();
+        let (job_pgid, last_pid) = if pipeline.len() > 1 {
+            spawn_pipeline_background(&pipeline, state.trace)?
+        } else {
+            let mut command = build_command(&pipeline[0])?;
+            spawn_command_background(&mut command, state.trace)?
+        };
+        let job_id = add_job_with_status(
+            &mut state.jobs,
+            &mut state.next_job_id,
+            job_pgid,
+            last_pid,
+            job_count,
+            display,
+            JobStatus::Running,
+        );
+        println!("[{job_id}] {job_pgid}");
+        state.last_status = 0;
+        return Ok(());
+    }
+
+    if pipeline.len() > 1 {
+        if pipeline
+            .iter()
+            .any(|cmd| is_builtin(cmd.args.first().map(String::as_str)))
+        {
+            eprintln!("pipes only work with external commands");
+            state.last_status = 2;
+            return Ok(());
+        }
+        match run_pipeline(&pipeline, &state.fg_pgid, state.shell_pgid, state.trace) {
+            Ok(result) => {
+                if matches!(result.outcome, WaitOutcome::Stopped) {
+                    let job_id = add_job_with_status(
+                        &mut state.jobs,
+                        &mut state.next_job_id,
+                        result.pgid,
+                        result.last_pid,
+                        pipeline.len(),
+                        display,
+                        JobStatus::Stopped,
+                    );
+                    println!("[{job_id}] Stopped {display}");
+                    state.last_status = 128 + libc::SIGTSTP;
+                } else {
+                    let last = result.status_code.unwrap_or(0);
+                    let pipefail = result.pipefail_status.unwrap_or(last);
+                    state.last_status = if state.pipefail { pipefail } else { last };
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                state.last_status = status_from_error(&err);
+            }
+        }
+        return Ok(());
+    }
+
+    let cmd = &pipeline[0];
+    execute_builtin(state, cmd, display)
+}
+
+pub(crate) fn trace_tokens(state: &ShellState, label: &str, tokens: &[String]) {
+    if state.trace {
+        eprintln!("trace: {label}: {tokens:?}");
+    }
+}
+
+fn trace_command_specs(state: &ShellState, pipeline: &[CommandSpec]) {
+    if !state.trace {
+        return;
+    }
+    for (idx, cmd) in pipeline.iter().enumerate() {
+        eprintln!("trace: argv[{idx}]: {:?}", cmd.args);
+        if let Some(ref path) = cmd.stdin {
+            eprintln!("trace: redirect stdin < {}", path);
+        }
+        if let Some(ref heredoc) = cmd.heredoc {
+            if let Some(ref content) = heredoc.content {
+                eprintln!("trace: redirect stdin << heredoc ({} bytes)", content.len());
+            } else {
+                eprintln!("trace: redirect stdin << {}", heredoc.delimiter);
+            }
+        }
+        if let Some(ref out) = cmd.stdout {
+            let mode = if out.append { ">>" } else { ">" };
+            eprintln!("trace: redirect stdout {mode} {}", out.path);
+        }
+    }
+}
+
+fn execute_command_substitution(
+    inner: &str,
+    fg_pgid: &Arc<AtomicI32>,
+    trace: bool,
+) -> Result<String, String> {
+    let tokens = parse_line(inner)?;
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let ctx = build_expansion_context(Arc::clone(fg_pgid), trace);
+    let expanded = expand_tokens(tokens, &ctx)?;
+    if expanded.is_empty() {
+        return Ok(String::new());
+    }
+    let expanded = expand_globs(expanded)?;
+    if expanded.is_empty() {
+        return Ok(String::new());
+    }
+    let segments = split_sequence(expanded)?;
+    let mut output = String::new();
+    let mut last_status = 0;
+
+    for segment in segments {
+        let should_run = match segment.op {
+            SeqOp::Always => true,
+            SeqOp::And => last_status == 0,
+            SeqOp::Or => last_status != 0,
+        };
+        if !should_run {
+            continue;
+        }
+        let (pipeline, background) = split_pipeline(segment.tokens)?;
+        if background {
+            return Err("background jobs not allowed in command substitution".to_string());
+        }
+        if pipeline
+            .iter()
+            .any(|cmd| is_builtin(cmd.args.first().map(String::as_str)))
+        {
+            let (text, status) = execute_builtin_substitution(&pipeline)?;
+            output.push_str(&text);
+            last_status = status;
+            continue;
+        }
+        let result = run_pipeline_capture(&pipeline, fg_pgid, trace)
+            .map_err(|err| format!("command substitution failed: {err}"))?;
+        output.push_str(&result.output);
+        last_status = result.status_code;
+    }
+
+    Ok(normalize_command_output(output))
+}
+
+pub(crate) fn build_expansion_context(
+    fg_pgid: Arc<AtomicI32>,
+    trace: bool,
+) -> ExpansionContext<'static> {
+    ExpansionContext {
+        lookup_var: Box::new(|name| env::var(name).ok()),
+        command_subst: Box::new(move |inner| execute_command_substitution(inner, &fg_pgid, trace)),
+    }
+}
+
+struct ShellState {
+    editor: Editor<LineHelper, DefaultHistory>,
+    fg_pgid: Arc<AtomicI32>,
+    sigchld_flag: Arc<AtomicBool>,
+    shell_pgid: i32,
+    aliases: HashMap<String, Vec<String>>,
+    prompt_template: Option<String>,
+    functions: HashMap<String, Vec<String>>,
+    jobs: Vec<Job>,
+    next_job_id: usize,
+    last_status: i32,
+    pipefail: bool,
+    interactive: bool,
+    trace: bool,
+}

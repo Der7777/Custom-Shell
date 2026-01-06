@@ -177,7 +177,7 @@ pub fn run_pipeline_capture(
             set_process_group_explicit(&mut command, 0);
         }
         if let Some(options) = sandbox_options_for_command(cmd, sandbox, trace) {
-            apply_sandbox(&mut command, options)?;
+            apply_sandbox(&mut command, &options)?;
         }
         let mut child = command
             .spawn()
@@ -278,7 +278,7 @@ pub fn run_pipeline(
             set_process_group_explicit(&mut command, 0);
         }
         if let Some(options) = sandbox_options_for_command(cmd, sandbox, trace) {
-            apply_sandbox(&mut command, options)?;
+            apply_sandbox(&mut command, &options)?;
         }
         let mut child = command
             .spawn()
@@ -377,7 +377,7 @@ pub fn spawn_pipeline_background(
             set_process_group_explicit(&mut command, 0);
         }
         if let Some(options) = sandbox_options_for_command(cmd, sandbox, trace) {
-            apply_sandbox(&mut command, options)?;
+            apply_sandbox(&mut command, &options)?;
         }
         let mut child = command
             .spawn()
@@ -445,7 +445,7 @@ pub fn spawn_pipeline_sandboxed(
             set_process_group_explicit(&mut command, 0);
         }
 
-        apply_sandbox(&mut command, options)?;
+        apply_sandbox(&mut command, &options)?;
         let mut child = command
             .spawn()
             .map_err(|err| wrap_spawn_error(&cmd.args[0], err))?;
@@ -482,7 +482,7 @@ pub fn run_command_in_foreground(
     set_process_group(command, fg_pgid);
     let handoff_guard = SignalMaskGuard::new()?;
     if let Some(options) = sandbox {
-        apply_sandbox(command, options)?;
+        apply_sandbox(command, &options)?;
     }
     let child = command
         .spawn()
@@ -521,7 +521,7 @@ pub fn spawn_command_background(
     let job_pgid = Arc::new(AtomicI32::new(0));
     set_process_group(command, &job_pgid);
     if let Some(options) = sandbox {
-        apply_sandbox(command, options)?;
+        apply_sandbox(command, &options)?;
     }
     let child = command
         .spawn()
@@ -545,7 +545,7 @@ pub fn spawn_command_sandboxed(
 ) -> io::Result<(i32, i32)> {
     let job_pgid = Arc::new(AtomicI32::new(0));
     set_process_group(command, &job_pgid);
-    apply_sandbox(command, options)?;
+    apply_sandbox(command, &options)?;
     let child = command
         .spawn()
         .map_err(|err| wrap_spawn_error(&command.get_program().to_string_lossy(), err))?;
@@ -625,7 +625,7 @@ fn heredoc_stdin(content: &str) -> io::Result<Stdio> {
     Ok(Stdio::from(file))
 }
 
-fn apply_sandbox(command: &mut Command, options: SandboxOptions) -> io::Result<()> {
+fn apply_sandbox(command: &mut Command, options: &SandboxOptions) -> io::Result<()> {
     #[cfg(feature = "sandbox")]
     {
         match options.backend {

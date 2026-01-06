@@ -5,6 +5,7 @@ use signal_hook::flag;
 use std::collections::HashMap;
 use std::env;
 use std::io;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicI32, Ordering},
@@ -88,6 +89,9 @@ fn main() {
     };
     editor.set_helper(Some(LineHelper::new()));
 
+    let history_path = env::var("HOME").map(PathBuf::from).unwrap_or_default().join(".custom_shell_history");
+    let _ = editor.load_history(&history_path);
+
     let mut state = ShellState {
         editor,
         fg_pgid,
@@ -114,6 +118,7 @@ fn main() {
     if let Some(directive) = sandbox_override {
         apply_sandbox_directive(&mut state.sandbox, directive);
     }
+    apply_sandbox_env(&mut state.sandbox);
     if let Err(err) = flag::register(SIGCHLD, Arc::clone(&state.sigchld_flag)) {
         eprintln!("error: {err}");
         return;
@@ -160,6 +165,8 @@ fn run_once(state: &mut ShellState) -> io::Result<()> {
             if state.interactive {
                 println!();
             }
+            let history_path = env::var("HOME").map(PathBuf::from).unwrap_or_default().join(".custom_shell_history");
+            let _ = state.editor.save_history(&history_path);
             std::process::exit(0);
         }
     };
@@ -429,6 +436,30 @@ fn execute_command_substitution(
     }
 
     Ok(normalize_command_output(output))
+}
+
+fn apply_sandbox_env(sandbox: &mut SandboxConfig) {
+    if let Ok(path) = env::var("MINISHELL_BWRAP_PATH") {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            sandbox.bubblewrap_path = None;
+        } else {
+            sandbox.bubblewrap_path = Some(trimmed.to_string());
+        }
+    }
+    if let Ok(args) = env::var("MINISHELL_BWRAP_ARGS") {
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            sandbox.bubblewrap_args.clear();
+        } else {
+            match parse_line(trimmed) {
+                Ok(tokens) => sandbox.bubblewrap_args = tokens,
+                Err(err) => {
+                    eprintln!("config error: invalid MINISHELL_BWRAP_ARGS: {err}");
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn build_expansion_context(

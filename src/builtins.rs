@@ -1,6 +1,11 @@
 use std::io;
 use std::sync::Arc;
 
+use crate::config::{format_abbreviation_line, save_abbreviations};
+use crate::colors::{apply_color_setting, format_color_lines, resolve_color, save_colors};
+use crate::completions::{
+    apply_completion_tokens, format_completion_lines, save_completion_file, suggest_command,
+};
 use crate::execution::{
     build_command, run_command_in_foreground, sandbox_options_for_command, status_from_error,
 };
@@ -18,7 +23,10 @@ use crate::{ShellState, build_expansion_context, execute_segment, trace_tokens};
 pub fn is_builtin(cmd: Option<&str>) -> bool {
     matches!(
         cmd,
-        Some("exit" | "cd" | "pwd" | "jobs" | "fg" | "bg" | "help")
+        Some(
+            "exit" | "cd" | "pwd" | "jobs" | "fg" | "bg" | "help" | "abbr" | "complete"
+                | "set_color" | "fish_config"
+        )
     )
 }
 
@@ -189,16 +197,165 @@ pub fn execute_builtin(state: &mut ShellState, cmd: &CommandSpec, display: &str)
             }
         }
         Some("help") => {
-            println!("Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code]");
+            if args.len() > 1 {
+                let topic = &args[1];
+                match std::process::Command::new("man").arg(topic).status() {
+                    Ok(status) => {
+                        state.last_status = if status.success() { 0 } else { 1 };
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        eprintln!("help: man not found");
+                        state.last_status = 127;
+                    }
+                    Err(err) => {
+                        eprintln!("help: {err}");
+                        state.last_status = 1;
+                    }
+                }
+                return Ok(());
+            }
+            println!(
+                "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], abbr, complete"
+            );
             println!(
                 "External commands support pipes with |, background jobs with &, and redirection with <, >, >>."
             );
             println!("Config: ~/.minishellrc (aliases, env vars, prompt).");
+            println!("Abbreviations: ~/.minishell_abbr (or abbr lines in ~/.minishellrc).");
             println!("Sandbox: prefix commands with sandbox=yes/no or use --sandbox/--no-sandbox.");
             println!("Completion: commands, filenames, $vars, %jobs.");
+            println!("Completions: ~/.minishell_completions and ~/.config/fish/completions/.");
+            println!("Prompt themes: fish (default), classic, minimal.");
+            println!("Prompt function: set prompt_function = name in config.");
+            println!("Colors: set_color key value (or ~/.minishell_colors).");
             println!(
                 "Expansion order: quotes/escapes -> command substitution -> vars/tilde -> glob (no IFS splitting)."
             );
+            state.last_status = 0;
+        }
+        Some("abbr") => {
+            if args.len() == 1 {
+                let mut entries: Vec<_> = state.abbreviations.iter().collect();
+                entries.sort_by_key(|(name, _)| *name);
+                for (name, tokens) in entries {
+                    println!("{}", format_abbreviation_line(name, tokens));
+                }
+                state.last_status = 0;
+                return Ok(());
+            }
+            if args[1] == "-e" || args[1] == "--erase" {
+                let Some(name) = args.get(2) else {
+                    eprintln!("abbr: missing name to erase");
+                    state.last_status = 2;
+                    return Ok(());
+                };
+                if state.abbreviations.remove(name).is_none() {
+                    eprintln!("abbr: no such abbreviation '{name}'");
+                    state.last_status = 1;
+                    return Ok(());
+                }
+                if let Err(err) = save_abbreviations(&state.abbreviations) {
+                    eprintln!("abbr: failed to save abbreviations: {err}");
+                    state.last_status = 1;
+                    return Ok(());
+                }
+                state.last_status = 0;
+                return Ok(());
+            }
+            if args.len() < 3 {
+                eprintln!("usage: abbr name expansion...");
+                eprintln!("       abbr -e name");
+                state.last_status = 2;
+                return Ok(());
+            }
+            let name = &args[1];
+            if !is_valid_var_name(name) {
+                eprintln!("abbr: invalid name '{name}'");
+                state.last_status = 2;
+                return Ok(());
+            }
+            let expansion = args[2..].iter().cloned().collect::<Vec<_>>();
+            state.abbreviations.insert(name.to_string(), expansion);
+            if let Err(err) = save_abbreviations(&state.abbreviations) {
+                eprintln!("abbr: failed to save abbreviations: {err}");
+                state.last_status = 1;
+                return Ok(());
+            }
+            state.last_status = 0;
+        }
+        Some("complete") => {
+            if args.len() == 1 {
+                for line in format_completion_lines(&state.completions) {
+                    println!("{line}");
+                }
+                state.last_status = 0;
+                return Ok(());
+            }
+            match apply_completion_tokens(args, &mut state.completions) {
+                Ok(()) => {
+                    if let Err(err) = save_completion_file(&state.completions) {
+                        eprintln!("complete: failed to save completions: {err}");
+                        state.last_status = 1;
+                        return Ok(());
+                    }
+                    state.last_status = 0;
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    eprintln!("usage: complete -c cmd -a 'items...'");
+                    eprintln!("       complete -c cmd -x 'script'");
+                    eprintln!("       complete -c cmd -r");
+                    state.last_status = 2;
+                }
+            }
+        }
+        Some("set_color") => {
+            if args.len() == 1 {
+                for line in format_color_lines(&state.colors) {
+                    println!("{line}");
+                }
+                state.last_status = 0;
+                return Ok(());
+            }
+            if args.len() < 3 {
+                eprintln!("usage: set_color key value");
+                eprintln!("       set_color");
+                state.last_status = 2;
+                return Ok(());
+            }
+            let key = args[1].trim().trim_start_matches("color.");
+            let value = args[2..].join(" ");
+            match apply_color_setting(&mut state.colors, key, value.trim()) {
+                Ok(()) => {
+                    if let Err(err) = save_colors(&state.colors) {
+                        eprintln!("set_color: failed to save colors: {err}");
+                        state.last_status = 1;
+                        return Ok(());
+                    }
+                    state.last_status = 0;
+                }
+                Err(err) => {
+                    eprintln!("set_color: {err}");
+                    state.last_status = 2;
+                }
+            }
+        }
+        Some("fish_config") => {
+            println!("Custom shell config (TUI placeholder).");
+            println!("Current colors:");
+            for line in format_color_lines(&state.colors) {
+                let mut parts = line.splitn(2, '=');
+                let key = parts.next().unwrap_or_default();
+                let value = parts.next().unwrap_or_default();
+                let color = resolve_color(value);
+                if color.is_empty() {
+                    println!("{key}={value}");
+                } else {
+                    println!("{key}={color}{value}\x1b[0m");
+                }
+            }
+            println!("Use: set_color key value");
+            println!("Keys: prompt_status, prompt_cwd, prompt_git, prompt_symbol, hint");
             state.last_status = 0;
         }
         Some("set") => {
@@ -259,6 +416,19 @@ pub fn execute_builtin(state: &mut ShellState, cmd: &CommandSpec, display: &str)
                 }
                 Err(err) => {
                     eprintln!("{err}");
+                    if err.kind() == io::ErrorKind::NotFound {
+                        if let Some(suggestion) = suggest_command(
+                            &cmd.args[0],
+                            &state.aliases,
+                            &state.functions,
+                            &state.abbreviations,
+                            &state.completions,
+                        ) {
+                            if suggestion != cmd.args[0] {
+                                eprintln!("Command not found—did you mean '{suggestion}'?");
+                            }
+                        }
+                    }
                     state.last_status = status_from_error(&err);
                 }
             }
@@ -282,11 +452,14 @@ pub fn execute_builtin_substitution(pipeline: &[CommandSpec]) -> Result<(String,
             Ok((cwd.display().to_string(), 0))
         }
         Some("help") => Ok((
-            "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code]".to_string(),
+            "Built-ins: cd [dir], pwd, jobs, fg [id], bg [id], help, exit [code], abbr, complete"
+                .to_string(),
             0,
         )),
         Some("cd") => Err("cd is not supported in command substitution".to_string()),
         Some("exit") => Err("exit is not supported in command substitution".to_string()),
+        Some("abbr") => Err("abbr is not supported in command substitution".to_string()),
+        Some("complete") => Err("complete is not supported in command substitution".to_string()),
         Some("jobs") | Some("fg") | Some("bg") => {
             Err("job control is not supported in command substitution".to_string())
         }

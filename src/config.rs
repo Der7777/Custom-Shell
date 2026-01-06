@@ -4,30 +4,31 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::colors::{ColorConfig, load_color_lines};
 use crate::execution::{SandboxConfig, apply_sandbox_directive};
+use crate::prompt::{PromptTheme, parse_prompt_theme, render_prompt_template, render_prompt_theme};
 use crate::parse::{OPERATOR_TOKEN_MARKER, parse_line, parse_sandbox_value};
 use crate::utils::is_valid_var_name;
 
 pub fn build_prompt(
     interactive: bool,
     prompt_template: &Option<String>,
+    prompt_function: &Option<String>,
+    prompt_theme: PromptTheme,
+    colors: &ColorConfig,
     last_status: i32,
     cwd: &Path,
 ) -> String {
     if !interactive {
         return String::new();
     }
+    if prompt_function.is_some() {
+        return String::new();
+    }
     if let Some(ref template) = prompt_template {
-        let status_str = last_status.to_string();
-        let status_opt = if last_status == 0 { "" } else { &status_str };
-        let mut out = template.replace("{status?}", status_opt);
-        out = out.replace("{status}", &status_str);
-        out = out.replace("{cwd}", &cwd.display().to_string());
-        out
-    } else if last_status == 0 {
-        format!("{} $ ", cwd.display())
+        render_prompt_template(template, last_status, cwd)
     } else {
-        format!("[{}] {} $ ", last_status, cwd.display())
+        render_prompt_theme(prompt_theme, colors, last_status, cwd)
     }
 }
 
@@ -47,10 +48,47 @@ pub fn apply_aliases(tokens: Vec<String>, aliases: &HashMap<String, Vec<String>>
     out
 }
 
+pub fn apply_abbreviations(
+    tokens: Vec<String>,
+    abbreviations: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut command_pos = true;
+    let mut iter = tokens.into_iter();
+    while let Some(token) = iter.next() {
+        if token.starts_with(OPERATOR_TOKEN_MARKER) {
+            if is_command_delimiter(&token) {
+                command_pos = true;
+            }
+            out.push(token);
+            continue;
+        }
+        if command_pos {
+            if let Some(expansion) = abbreviations.get(&token) {
+                out.extend(expansion.iter().cloned());
+                command_pos = false;
+                continue;
+            }
+        }
+        out.push(token);
+        command_pos = false;
+    }
+    out
+}
+
+fn is_command_delimiter(token: &str) -> bool {
+    let op = token.trim_start_matches(OPERATOR_TOKEN_MARKER);
+    matches!(op, "|" | "||" | "&&" | ";" | "&")
+}
+
 pub fn load_config(
     aliases: &mut HashMap<String, Vec<String>>,
     prompt_template: &mut Option<String>,
+    prompt_function: &mut Option<String>,
+    prompt_theme: &mut PromptTheme,
+    colors: &mut ColorConfig,
     sandbox: &mut SandboxConfig,
+    abbreviations: &mut HashMap<String, Vec<String>>,
 ) -> io::Result<()> {
     let Some(home) = env::var("HOME").ok() else {
         return Ok(());
@@ -73,6 +111,12 @@ pub fn load_config(
             }
             continue;
         }
+        if let Some(rest) = line.strip_prefix("abbr ") {
+            if let Err(err) = parse_abbreviation(abbreviations, rest, idx + 1) {
+                eprintln!("config:{}: {err}", idx + 1);
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("export ") {
             if let Err(err) = parse_assignment(rest, idx + 1) {
                 eprintln!("config:{}: {err}", idx + 1);
@@ -84,6 +128,27 @@ pub fn load_config(
             let value = strip_quotes(value.trim());
             if key.eq_ignore_ascii_case("prompt") || key == "PROMPT" {
                 *prompt_template = Some(value.to_string());
+                continue;
+            }
+            if key.eq_ignore_ascii_case("prompt_function") || key.eq_ignore_ascii_case("prompt_func")
+            {
+                if value.trim().is_empty() {
+                    *prompt_function = None;
+                } else {
+                    *prompt_function = Some(value.trim().to_string());
+                }
+                continue;
+            }
+            if key.eq_ignore_ascii_case("prompt_theme") || key.eq_ignore_ascii_case("theme") {
+                if let Some(theme) = parse_prompt_theme(value) {
+                    *prompt_theme = theme;
+                } else {
+                    eprintln!("config:{}: unknown theme '{value}'", idx + 1);
+                }
+                continue;
+            }
+            if let Some(color_key) = key.strip_prefix("color.") {
+                load_color_lines(colors, &format!("color.{color_key}={value}"));
                 continue;
             }
             if key.eq_ignore_ascii_case("sandbox") {
@@ -99,6 +164,26 @@ pub fn load_config(
             continue;
         }
         eprintln!("config:{}: unrecognized directive", idx + 1);
+    }
+
+    let abbr_path = format!("{home}/.minishell_abbr");
+    if let Ok(content) = fs::read_to_string(&abbr_path) {
+        for (idx, raw) in content.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("abbr ") {
+                if let Err(err) = parse_abbreviation(abbreviations, rest, idx + 1) {
+                    eprintln!("abbr:{}: {err}", idx + 1);
+                }
+            }
+        }
+    }
+
+    let colors_path = format!("{home}/.minishell_colors");
+    if let Ok(content) = fs::read_to_string(&colors_path) {
+        load_color_lines(colors, &content);
     }
 
     Ok(())
@@ -140,6 +225,32 @@ fn parse_assignment(input: &str, line: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_abbreviation(
+    abbreviations: &mut HashMap<String, Vec<String>>,
+    input: &str,
+    line: usize,
+) -> Result<(), String> {
+    let trimmed = input.trim();
+    let split_at = trimmed
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .ok_or_else(|| format!("abbr missing value on line {line}"))?;
+    let name = trimmed[..split_at].trim();
+    let value = trimmed[split_at..].trim();
+    if !is_valid_var_name(name) {
+        return Err(format!("invalid abbr name '{name}' on line {line}"));
+    }
+    let value = strip_quotes(value);
+    let tokens = parse_line(value)
+        .map_err(|err| format!("abbr parse error on line {line}: {err}"))?;
+    if tokens.is_empty() {
+        return Err(format!("abbr '{name}' empty on line {line}"));
+    }
+    abbreviations.insert(name.to_string(), tokens);
+    Ok(())
+}
+
 fn strip_quotes(input: &str) -> &str {
     let bytes = input.as_bytes();
     if bytes.len() >= 2 {
@@ -150,4 +261,58 @@ fn strip_quotes(input: &str) -> &str {
         }
     }
     input
+}
+
+pub fn save_abbreviations(abbreviations: &HashMap<String, Vec<String>>) -> io::Result<()> {
+    let Some(home) = env::var("HOME").ok() else {
+        return Ok(());
+    };
+    let path = format!("{home}/.minishell_abbr");
+    let mut entries: Vec<_> = abbreviations.iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    let mut out = String::new();
+    for (name, tokens) in entries {
+        out.push_str(&format_abbreviation_line(name, tokens));
+        out.push('\n');
+    }
+    fs::write(path, out)
+}
+
+pub fn format_abbreviation_line(name: &str, tokens: &[String]) -> String {
+    let value = tokens
+        .iter()
+        .map(|token| shell_quote(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out = String::from("abbr ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&value);
+    out
+}
+
+fn shell_quote(token: &str) -> String {
+    if token.is_empty() || token.chars().any(needs_quotes) {
+        let mut out = String::from("'");
+        for ch in token.chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
+    } else {
+        token.to_string()
+    }
+}
+
+fn needs_quotes(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '\'' | '"' | '\\' | '$' | '`' | '#' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{'
+                | '}'
+        )
 }

@@ -14,11 +14,23 @@ pub fn install_signal_handlers() -> io::Result<()> {
     Ok(())
 }
 
-pub fn init_session() -> io::Result<i32> {
+pub fn init_session(interactive: bool) -> io::Result<i32> {
     let pid = unsafe { libc::getpid() };
-    let sid = unsafe { libc::getsid(0) };
-    if sid != pid {
-        let rc = unsafe { libc::setsid() };
+    if !interactive {
+        let sid = unsafe { libc::getsid(0) };
+        if sid != pid {
+            let rc = unsafe { libc::setsid() };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EPERM) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    let pgid = unsafe { libc::getpgrp() };
+    if interactive && pgid != pid {
+        let rc = unsafe { libc::setpgid(0, 0) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }

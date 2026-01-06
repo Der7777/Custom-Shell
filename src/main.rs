@@ -13,7 +13,10 @@ use std::sync::{
 
 mod builtins;
 mod completion;
+mod completions;
 mod config;
+mod colors;
+mod prompt;
 mod execution;
 mod expansion;
 mod heredoc;
@@ -25,7 +28,10 @@ mod utils;
 
 use builtins::{execute_builtin, execute_builtin_substitution, is_builtin, try_execute_compound};
 use completion::LineHelper;
-use config::{apply_aliases, build_prompt, load_config};
+use completions::{CompletionSet, default_completions, load_completion_files, suggest_command};
+use config::{apply_abbreviations, apply_aliases, build_prompt, load_config};
+use colors::ColorConfig;
+use prompt::PromptTheme;
 use execution::{
     SandboxConfig, apply_sandbox_directive, build_command, run_pipeline, run_pipeline_capture,
     sandbox_options_for_command, spawn_command_background, spawn_pipeline_background,
@@ -65,7 +71,7 @@ fn main() {
         eprintln!("error: {err}");
         return;
     }
-    let shell_pgid = match init_session() {
+    let shell_pgid = match init_session(interactive) {
         Ok(pgid) => pgid,
         Err(err) => {
             eprintln!("error: {err}");
@@ -99,7 +105,12 @@ fn main() {
         shell_pgid,
         aliases: HashMap::new(),
         prompt_template: None,
+        prompt_function: None,
+        prompt_theme: PromptTheme::Fish,
+        colors: ColorConfig::default(),
         functions: HashMap::new(),
+        abbreviations: HashMap::new(),
+        completions: CompletionSet::default(),
         jobs: Vec::new(),
         next_job_id: 1,
         last_status: 0,
@@ -111,9 +122,17 @@ fn main() {
     if let Err(err) = load_config(
         &mut state.aliases,
         &mut state.prompt_template,
+        &mut state.prompt_function,
+        &mut state.prompt_theme,
+        &mut state.colors,
         &mut state.sandbox,
+        &mut state.abbreviations,
     ) {
         eprintln!("config error: {err}");
+    }
+    state.completions = default_completions();
+    if let Err(err) = load_completion_files(&mut state.completions) {
+        eprintln!("completion load error: {err}");
     }
     if let Some(directive) = sandbox_override {
         apply_sandbox_directive(&mut state.sandbox, directive);
@@ -148,6 +167,9 @@ fn run_once(state: &mut ShellState) -> io::Result<()> {
             &mut state.editor,
             &state.aliases,
             &state.functions,
+            &state.abbreviations,
+            &state.completions,
+            &state.colors,
             &state.jobs,
         );
     }
@@ -155,9 +177,17 @@ fn run_once(state: &mut ShellState) -> io::Result<()> {
     let prompt = build_prompt(
         state.interactive,
         &state.prompt_template,
+        &state.prompt_function,
+        state.prompt_theme,
+        &state.colors,
         state.last_status,
         &cwd,
     );
+    let prompt = if let Some(name) = state.prompt_function.clone() {
+        run_prompt_function(state, &name).unwrap_or(prompt)
+    } else {
+        prompt
+    };
 
     let line = match read_input_line(&mut state.editor, state.interactive, &prompt)? {
         Some(line) => line,
@@ -257,6 +287,7 @@ pub(crate) fn execute_segment(
     tokens: Vec<String>,
     display: &str,
 ) -> io::Result<()> {
+    let tokens = apply_abbreviations(tokens, &state.abbreviations);
     let tokens = apply_aliases(tokens, &state.aliases);
     trace_tokens(state, "segment tokens", &tokens);
     let (mut pipeline, background) = match split_pipeline(tokens) {
@@ -342,6 +373,19 @@ pub(crate) fn execute_segment(
             }
             Err(err) => {
                 eprintln!("{err}");
+                if err.kind() == io::ErrorKind::NotFound {
+                    if let Some(suggestion) = suggest_command(
+                        &pipeline[0].args[0],
+                        &state.aliases,
+                        &state.functions,
+                        &state.abbreviations,
+                        &state.completions,
+                    ) {
+                        if suggestion != pipeline[0].args[0] {
+                            eprintln!("Command not found—did you mean '{suggestion}'?");
+                        }
+                    }
+                }
                 state.last_status = status_from_error(&err);
             }
         }
@@ -438,6 +482,70 @@ fn execute_command_substitution(
     Ok(normalize_command_output(output))
 }
 
+fn run_prompt_function(state: &mut ShellState, name: &str) -> Option<String> {
+    let tokens = state.functions.get(name)?.clone();
+    let saved_status = state.last_status;
+    let result = execute_tokens_capture(
+        tokens,
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+    )
+    .ok();
+    state.last_status = saved_status;
+    result
+}
+
+fn execute_tokens_capture(
+    tokens: Vec<String>,
+    fg_pgid: Arc<AtomicI32>,
+    trace: bool,
+    sandbox: SandboxConfig,
+) -> Result<String, String> {
+    let ctx = build_expansion_context(Arc::clone(&fg_pgid), trace, sandbox.clone());
+    let expanded = expand_tokens(tokens, &ctx)?;
+    if expanded.is_empty() {
+        return Ok(String::new());
+    }
+    let expanded = expand_globs(expanded)?;
+    if expanded.is_empty() {
+        return Ok(String::new());
+    }
+    let segments = split_sequence(expanded)?;
+    let mut output = String::new();
+    let mut last_status = 0;
+
+    for segment in segments {
+        let should_run = match segment.op {
+            SeqOp::Always => true,
+            SeqOp::And => last_status == 0,
+            SeqOp::Or => last_status != 0,
+        };
+        if !should_run {
+            continue;
+        }
+        let (pipeline, background) = split_pipeline(segment.tokens)?;
+        if background {
+            return Err("background jobs not allowed in prompt function".to_string());
+        }
+        if pipeline
+            .iter()
+            .any(|cmd| is_builtin(cmd.args.first().map(String::as_str)))
+        {
+            let (text, status) = execute_builtin_substitution(&pipeline)?;
+            output.push_str(&text);
+            last_status = status;
+            continue;
+        }
+        let result = run_pipeline_capture(&pipeline, &fg_pgid, trace, &sandbox)
+            .map_err(|err| format!("prompt function failed: {err}"))?;
+        output.push_str(&result.output);
+        last_status = result.status_code;
+    }
+
+    Ok(normalize_command_output(output))
+}
+
 fn apply_sandbox_env(sandbox: &mut SandboxConfig) {
     if let Ok(path) = env::var("MINISHELL_BWRAP_PATH") {
         let trimmed = path.trim();
@@ -482,7 +590,12 @@ struct ShellState {
     shell_pgid: i32,
     aliases: HashMap<String, Vec<String>>,
     prompt_template: Option<String>,
+    prompt_function: Option<String>,
+    prompt_theme: PromptTheme,
+    colors: ColorConfig,
     functions: HashMap<String, Vec<String>>,
+    abbreviations: HashMap<String, Vec<String>>,
+    completions: CompletionSet,
     jobs: Vec<Job>,
     next_job_id: usize,
     last_status: i32,

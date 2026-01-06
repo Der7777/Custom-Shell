@@ -62,6 +62,7 @@ impl Default for SandboxConfig {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "sandbox"), allow(dead_code))]
 pub struct SandboxOptions {
     pub trace: bool,
     pub backend: SandboxBackend,
@@ -405,6 +406,7 @@ pub fn spawn_pipeline_background(
     Ok((pgid.unwrap_or(0), last_pid.unwrap_or(0)))
 }
 
+#[cfg_attr(not(feature = "sandbox"), allow(dead_code))]
 pub fn spawn_pipeline_sandboxed(
     pipeline: &[CommandSpec],
     options: SandboxOptions,
@@ -539,6 +541,7 @@ pub fn spawn_command_background(
     Ok((job_pgid.load(Ordering::SeqCst), child.id() as i32))
 }
 
+#[cfg_attr(not(feature = "sandbox"), allow(dead_code))]
 pub fn spawn_command_sandboxed(
     command: &mut Command,
     options: SandboxOptions,

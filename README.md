@@ -50,9 +50,10 @@ cargo fuzz run parser
 
 ## Security notes
 
-This shell does not sandbox execution. Do not run untrusted scripts or binaries.
+By default, this shell does not sandbox execution. Do not run untrusted scripts or binaries.
+The optional `sandbox` feature lets you run commands with `sandbox=yes` or `--sandbox`, but it is not a security boundary unless configured correctly.
 For isolation, run inside a container/VM or wrap with OS-level sandboxes (e.g., seccomp, namespaces, chroot), and consider dropping privileges before executing commands.
-Command substitution currently runs with the full environment and privileges of the shell. If you need stricter isolation, consider a future mode that runs substitutions with a reduced environment (whitelist) or inside a sandbox (e.g., chroot/namespace or a separate helper process).
+Command substitution runs with the full environment and privileges of the shell unless sandboxing is enabled.
 
 ## CI
 

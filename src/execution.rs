@@ -10,12 +10,18 @@ use std::sync::{
 
 use log::debug;
 use nix::unistd::{pipe, write};
+#[cfg(feature = "sandbox")]
+use std::ffi::CString;
+#[cfg(feature = "sandbox")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(feature = "sandbox")]
+use std::os::unix::process::CommandExt;
 
 use crate::job_control::{
     SignalMaskGuard, TerminalGuard, TermiosGuard, WaitOutcome, WaitResult, set_process_group,
     set_process_group_explicit, wait_for_process_group,
 };
-use crate::parse::CommandSpec;
+use crate::parse::{CommandSpec, SandboxDirective};
 
 pub struct ForegroundResult {
     pub outcome: WaitOutcome,
@@ -30,10 +36,102 @@ pub struct CaptureResult {
     pub status_code: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum SandboxBackend {
+    Bubblewrap,
+    Native,
+}
+
+#[derive(Debug, Clone)]
+pub struct SandboxConfig {
+    pub enabled: bool,
+    pub backend: SandboxBackend,
+    pub bubblewrap_path: Option<String>,
+    pub bubblewrap_args: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: SandboxBackend::Native,
+            bubblewrap_path: None,
+            bubblewrap_args: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SandboxOptions {
+    pub trace: bool,
+    pub backend: SandboxBackend,
+    pub bubblewrap_path: Option<String>,
+    pub bubblewrap_args: Vec<String>,
+}
+
+impl Default for SandboxOptions {
+    fn default() -> Self {
+        Self {
+            trace: false,
+            backend: SandboxBackend::Native,
+            bubblewrap_path: None,
+            bubblewrap_args: Vec::new(),
+        }
+    }
+}
+
+pub fn apply_sandbox_directive(sandbox: &mut SandboxConfig, directive: SandboxDirective) {
+    match directive {
+        SandboxDirective::Enable => sandbox.enabled = true,
+        SandboxDirective::Disable => sandbox.enabled = false,
+        SandboxDirective::Bubblewrap => {
+            sandbox.enabled = true;
+            sandbox.backend = SandboxBackend::Bubblewrap;
+        }
+        SandboxDirective::Native => {
+            sandbox.enabled = true;
+            sandbox.backend = SandboxBackend::Native;
+        }
+    }
+}
+
+pub fn sandbox_options_for_command(
+    cmd: &CommandSpec,
+    sandbox: &SandboxConfig,
+    trace: bool,
+) -> Option<SandboxOptions> {
+    let mut enabled = sandbox.enabled;
+    let mut backend = sandbox.backend;
+    if let Some(directive) = cmd.sandbox {
+        match directive {
+            SandboxDirective::Enable => enabled = true,
+            SandboxDirective::Disable => enabled = false,
+            SandboxDirective::Bubblewrap => {
+                enabled = true;
+                backend = SandboxBackend::Bubblewrap;
+            }
+            SandboxDirective::Native => {
+                enabled = true;
+                backend = SandboxBackend::Native;
+            }
+        }
+    }
+    if !enabled {
+        return None;
+    }
+    Some(SandboxOptions {
+        trace,
+        backend,
+        bubblewrap_path: sandbox.bubblewrap_path.clone(),
+        bubblewrap_args: sandbox.bubblewrap_args.clone(),
+    })
+}
+
 pub fn run_pipeline_capture(
     pipeline: &[CommandSpec],
     fg_pgid: &Arc<AtomicI32>,
     trace: bool,
+    sandbox: &SandboxConfig,
 ) -> io::Result<CaptureResult> {
     debug!("job event=capture start count={}", pipeline.len());
     let mut children = Vec::with_capacity(pipeline.len());
@@ -77,6 +175,9 @@ pub fn run_pipeline_capture(
             set_process_group_explicit(&mut command, id);
         } else {
             set_process_group_explicit(&mut command, 0);
+        }
+        if let Some(options) = sandbox_options_for_command(cmd, sandbox, trace) {
+            apply_sandbox(&mut command, options)?;
         }
         let mut child = command
             .spawn()
@@ -137,6 +238,7 @@ pub fn run_pipeline(
     fg_pgid: &Arc<AtomicI32>,
     shell_pgid: i32,
     trace: bool,
+    sandbox: &SandboxConfig,
 ) -> io::Result<ForegroundResult> {
     debug!("job event=pipeline start count={}", pipeline.len());
     let mut prev_stdout = None;
@@ -174,6 +276,9 @@ pub fn run_pipeline(
             set_process_group_explicit(&mut command, id);
         } else {
             set_process_group_explicit(&mut command, 0);
+        }
+        if let Some(options) = sandbox_options_for_command(cmd, sandbox, trace) {
+            apply_sandbox(&mut command, options)?;
         }
         let mut child = command
             .spawn()
@@ -231,7 +336,11 @@ pub fn run_pipeline(
     })
 }
 
-pub fn spawn_pipeline_background(pipeline: &[CommandSpec], trace: bool) -> io::Result<(i32, i32)> {
+pub fn spawn_pipeline_background(
+    pipeline: &[CommandSpec],
+    trace: bool,
+    sandbox: &SandboxConfig,
+) -> io::Result<(i32, i32)> {
     let mut prev_stdout = None;
     let mut pgid: Option<i32> = None;
     let mut last_pid: Option<i32> = None;
@@ -267,6 +376,9 @@ pub fn spawn_pipeline_background(pipeline: &[CommandSpec], trace: bool) -> io::R
         } else {
             set_process_group_explicit(&mut command, 0);
         }
+        if let Some(options) = sandbox_options_for_command(cmd, sandbox, trace) {
+            apply_sandbox(&mut command, options)?;
+        }
         let mut child = command
             .spawn()
             .map_err(|err| wrap_spawn_error(&cmd.args[0], err))?;
@@ -293,14 +405,85 @@ pub fn spawn_pipeline_background(pipeline: &[CommandSpec], trace: bool) -> io::R
     Ok((pgid.unwrap_or(0), last_pid.unwrap_or(0)))
 }
 
+pub fn spawn_pipeline_sandboxed(
+    pipeline: &[CommandSpec],
+    options: SandboxOptions,
+) -> io::Result<(i32, i32)> {
+    let mut prev_stdout = None;
+    let mut pgid: Option<i32> = None;
+    let mut last_pid: Option<i32> = None;
+
+    for (idx, cmd) in pipeline.iter().enumerate() {
+        let mut command = Command::new(&cmd.args[0]);
+        command.args(&cmd.args[1..]);
+
+        if let Some(stdout) = prev_stdout.take() {
+            if cmd.stdin.is_none() && cmd.heredoc.is_none() {
+                command.stdin(Stdio::from(stdout));
+            }
+        }
+
+        apply_input_redirection(&mut command, cmd)?;
+
+        if idx + 1 < pipeline.len() {
+            command.stdout(Stdio::piped());
+        } else if let Some(ref output) = cmd.stdout {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true);
+            if output.append {
+                opts.append(true);
+            } else {
+                opts.truncate(true);
+            }
+            let file = opts.open(&output.path)?;
+            command.stdout(Stdio::from(file));
+        }
+
+        if let Some(id) = pgid {
+            set_process_group_explicit(&mut command, id);
+        } else {
+            set_process_group_explicit(&mut command, 0);
+        }
+
+        apply_sandbox(&mut command, options)?;
+        let mut child = command
+            .spawn()
+            .map_err(|err| wrap_spawn_error(&cmd.args[0], err))?;
+        if options.trace {
+            let pid = child.id();
+            let pgid = pgid.unwrap_or(pid as i32);
+            eprintln!("trace: spawn sandboxed bg pid {pid} pgid {pgid}");
+        }
+        debug!(
+            "job event=spawn kind=sandboxed-background idx={} pid={} pgid={}",
+            idx,
+            child.id(),
+            pgid.unwrap_or(child.id() as i32)
+        );
+        if pgid.is_none() {
+            pgid = Some(child.id() as i32);
+        }
+        if idx + 1 == pipeline.len() {
+            last_pid = Some(child.id() as i32);
+        }
+        prev_stdout = child.stdout.take();
+    }
+
+    Ok((pgid.unwrap_or(0), last_pid.unwrap_or(0)))
+}
+
 pub fn run_command_in_foreground(
     command: &mut Command,
     fg_pgid: &Arc<AtomicI32>,
     shell_pgid: i32,
     trace: bool,
+    sandbox: Option<SandboxOptions>,
 ) -> io::Result<ForegroundResult> {
     set_process_group(command, fg_pgid);
     let handoff_guard = SignalMaskGuard::new()?;
+    if let Some(options) = sandbox {
+        apply_sandbox(command, options)?;
+    }
     let child = command
         .spawn()
         .map_err(|err| wrap_spawn_error(&command.get_program().to_string_lossy(), err))?;
@@ -330,9 +513,16 @@ pub fn run_command_in_foreground(
     })
 }
 
-pub fn spawn_command_background(command: &mut Command, trace: bool) -> io::Result<(i32, i32)> {
+pub fn spawn_command_background(
+    command: &mut Command,
+    trace: bool,
+    sandbox: Option<SandboxOptions>,
+) -> io::Result<(i32, i32)> {
     let job_pgid = Arc::new(AtomicI32::new(0));
     set_process_group(command, &job_pgid);
+    if let Some(options) = sandbox {
+        apply_sandbox(command, options)?;
+    }
     let child = command
         .spawn()
         .map_err(|err| wrap_spawn_error(&command.get_program().to_string_lossy(), err))?;
@@ -342,6 +532,29 @@ pub fn spawn_command_background(command: &mut Command, trace: bool) -> io::Resul
     }
     debug!(
         "job event=spawn kind=background-single pid={} pgid={}",
+        child.id(),
+        child.id()
+    );
+    job_pgid.store(child.id() as i32, Ordering::SeqCst);
+    Ok((job_pgid.load(Ordering::SeqCst), child.id() as i32))
+}
+
+pub fn spawn_command_sandboxed(
+    command: &mut Command,
+    options: SandboxOptions,
+) -> io::Result<(i32, i32)> {
+    let job_pgid = Arc::new(AtomicI32::new(0));
+    set_process_group(command, &job_pgid);
+    apply_sandbox(command, options)?;
+    let child = command
+        .spawn()
+        .map_err(|err| wrap_spawn_error(&command.get_program().to_string_lossy(), err))?;
+    if options.trace {
+        let pid = child.id();
+        eprintln!("trace: spawn sandboxed bg pid {pid} pgid {pid}");
+    }
+    debug!(
+        "job event=spawn kind=sandboxed-background-single pid={} pgid={}",
         child.id(),
         child.id()
     );
@@ -410,6 +623,77 @@ fn heredoc_stdin(content: &str) -> io::Result<Stdio> {
     drop(write_fd);
     let file = unsafe { fs::File::from_raw_fd(read_fd.into_raw_fd()) };
     Ok(Stdio::from(file))
+}
+
+fn apply_sandbox(command: &mut Command, options: SandboxOptions) -> io::Result<()> {
+    #[cfg(feature = "sandbox")]
+    {
+        match options.backend {
+            SandboxBackend::Bubblewrap => {
+                let program = command.get_program().to_os_string();
+                let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+                let bwrap_path = options.bubblewrap_path.unwrap_or_else(|| "bwrap".to_string());
+                let bwrap_path_os = std::ffi::OsString::from(bwrap_path);
+                let mut bwrap_args = options
+                    .bubblewrap_args
+                    .into_iter()
+                    .map(|arg| arg.into())
+                    .collect::<Vec<_>>();
+                bwrap_args.push("--".into());
+                bwrap_args.push(program);
+                bwrap_args.extend(args);
+                unsafe {
+                    command.pre_exec(move || {
+                        execvp_os(&bwrap_path_os, &bwrap_args).map_err(|err| {
+                            io::Error::new(
+                                err.kind(),
+                                format!("bwrap exec failed: {err}"),
+                            )
+                        })
+                    });
+                }
+                Ok(())
+            }
+            SandboxBackend::Native => {
+                let program = command.get_program().to_os_string();
+                let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+                unsafe {
+                    command.pre_exec(move || native_sandbox_exec(&program, &args));
+                }
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let _ = (command, options);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "sandbox feature disabled",
+        ))
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn execvp_os(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> io::Result<()> {
+    let prog_c = CString::new(program.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "program contains null"))?;
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(prog_c.clone());
+    for arg in args {
+        let cstr = CString::new(arg.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "argument contains null")
+        })?;
+        argv.push(cstr);
+    }
+    nix::unistd::execvp(&prog_c, &argv).map_err(|err| io::Error::other(err.to_string()))?;
+    Ok(())
+}
+
+#[cfg(feature = "sandbox")]
+fn native_sandbox_exec(program: &std::ffi::OsString, args: &[std::ffi::OsString]) -> io::Result<()> {
+    // Placeholder for advanced native sandbox setup.
+    execvp_os(program, args)
 }
 
 pub fn wrap_spawn_error(cmd: &str, err: io::Error) -> io::Error {

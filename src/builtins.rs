@@ -1,7 +1,9 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::execution::{build_command, run_command_in_foreground, status_from_error};
+use crate::execution::{
+    build_command, run_command_in_foreground, sandbox_options_for_command, status_from_error,
+};
 use crate::expansion::{expand_globs, expand_tokens};
 use crate::io_helpers::read_input_line;
 use crate::job_control::{
@@ -44,7 +46,11 @@ pub fn try_execute_compound(
 }
 
 pub fn execute_script_tokens(state: &mut ShellState, tokens: Vec<String>) -> io::Result<()> {
-    let ctx = build_expansion_context(Arc::clone(&state.fg_pgid), state.trace);
+    let ctx = build_expansion_context(
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+    );
     let expanded = match expand_tokens(tokens, &ctx) {
         Ok(v) => v,
         Err(msg) => {
@@ -188,6 +194,7 @@ pub fn execute_builtin(state: &mut ShellState, cmd: &CommandSpec, display: &str)
                 "External commands support pipes with |, background jobs with &, and redirection with <, >, >>."
             );
             println!("Config: ~/.minishellrc (aliases, env vars, prompt).");
+            println!("Sandbox: prefix commands with sandbox=yes/no or use --sandbox/--no-sandbox.");
             println!("Completion: commands, filenames, $vars, %jobs.");
             println!(
                 "Expansion order: quotes/escapes -> command substitution -> vars/tilde -> glob (no IFS splitting)."
@@ -223,11 +230,13 @@ pub fn execute_builtin(state: &mut ShellState, cmd: &CommandSpec, display: &str)
                 return Ok(());
             }
             let mut command = build_command(cmd)?;
+            let sandbox = sandbox_options_for_command(cmd, &state.sandbox, state.trace);
             match run_command_in_foreground(
                 &mut command,
                 &state.fg_pgid,
                 state.shell_pgid,
                 state.trace,
+                sandbox,
             ) {
                 Ok(result) => {
                     if matches!(result.outcome, WaitOutcome::Stopped) {

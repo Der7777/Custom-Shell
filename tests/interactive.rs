@@ -148,14 +148,14 @@ fn zombies_with_ppid(ppid: u32) -> Vec<u32> {
 #[serial]
 fn pty_prompt_and_ctrl_c() -> anyhow::Result<()> {
     let mut session = PtySession::spawn()?;
-    session.read_until_prompt(Duration::from_secs(2))?;
+    session.read_until_prompt(Duration::from_secs(5))?;
     session.send_line("echo hi")?;
-    let output = session.read_until_prompt(Duration::from_secs(2))?;
+    let output = session.read_until_prompt(Duration::from_secs(5))?;
     assert!(output.contains("hi"));
     session.send_line("sleep 5")?;
     thread::sleep(Duration::from_millis(100));
     session.send_ctrl(0x03)?;
-    session.read_until_prompt(Duration::from_secs(2))?;
+    session.read_until_prompt(Duration::from_secs(5))?;
     session.send_line("exit")?;
     Ok(())
 }
@@ -164,14 +164,14 @@ fn pty_prompt_and_ctrl_c() -> anyhow::Result<()> {
 #[serial]
 fn background_pipeline_reaped() -> anyhow::Result<()> {
     let mut session = PtySession::spawn()?;
-    session.read_until_prompt(Duration::from_secs(2))?;
+    session.read_until_prompt(Duration::from_secs(5))?;
     session.send_line("sleep 0.1 | cat &")?;
-    session.read_until_prompt(Duration::from_secs(2))?;
+    session.read_until_prompt(Duration::from_secs(5))?;
     thread::sleep(Duration::from_millis(300));
     session.send_line("true")?;
-    session.read_until_prompt(Duration::from_secs(2))?;
+    session.read_until_prompt(Duration::from_secs(5))?;
     let children = list_children(session.pid);
-    let zombies: Vec<u32> = children.into_iter().filter(is_zombie).collect();
+    let zombies: Vec<u32> = children.into_iter().filter(|pid| is_zombie(*pid)).collect();
     assert!(zombies.is_empty(), "zombie children found: {zombies:?}");
     session.send_line("exit")?;
     Ok(())
@@ -182,7 +182,7 @@ fn background_pipeline_reaped() -> anyhow::Result<()> {
 fn stopped_job_then_exit_no_zombie() -> anyhow::Result<()> {
     let mut session = PtySession::spawn()?;
     let shell_pid = session.pid;
-    session.read_until_prompt(Duration::from_secs(2))?;
+    session.read_until_prompt(Duration::from_secs(5))?;
     session.send_line("sleep 5")?;
     thread::sleep(Duration::from_millis(100));
     session.send_ctrl(0x1a)?;

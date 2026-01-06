@@ -39,12 +39,21 @@ pub struct HeredocSpec {
     pub content: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SandboxDirective {
+    Enable,
+    Disable,
+    Bubblewrap,
+    Native,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
     pub args: Vec<String>,
     pub stdin: Option<String>,
     pub heredoc: Option<HeredocSpec>,
     pub stdout: Option<OutputRedirection>,
+    pub sandbox: Option<SandboxDirective>,
 }
 
 impl CommandSpec {
@@ -54,6 +63,7 @@ impl CommandSpec {
             stdin: None,
             heredoc: None,
             stdout: None,
+            sandbox: None,
         }
     }
 }
@@ -512,6 +522,16 @@ pub fn split_pipeline(tokens: Vec<String>) -> Result<(Vec<CommandSpec>, bool), S
             continue;
         }
 
+        if current.args.is_empty() {
+            if let Some(directive) = try_parse_sandbox_directive(&token)? {
+                if current.sandbox.is_some() {
+                    return Err("duplicate sandbox directive".to_string());
+                }
+                current.sandbox = Some(directive);
+                continue;
+            }
+        }
+
         current.args.push(token);
     }
 
@@ -521,6 +541,29 @@ pub fn split_pipeline(tokens: Vec<String>) -> Result<(Vec<CommandSpec>, bool), S
 
     pipeline.push(current);
     Ok((pipeline, background))
+}
+
+pub fn parse_sandbox_value(value: &str) -> Result<SandboxDirective, String> {
+    let value = value.trim();
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "yes" | "true" | "on" => Ok(SandboxDirective::Enable),
+        "0" | "no" | "false" | "off" => Ok(SandboxDirective::Disable),
+        "bwrap" | "bubblewrap" => Ok(SandboxDirective::Bubblewrap),
+        "native" => Ok(SandboxDirective::Native),
+        _ => Err(format!("invalid sandbox value '{value}'")),
+    }
+}
+
+fn try_parse_sandbox_directive(token: &str) -> Result<Option<SandboxDirective>, String> {
+    let Some((key, value)) = token.split_once('=') else {
+        return Ok(None);
+    };
+    if !key.eq_ignore_ascii_case("sandbox") {
+        return Ok(None);
+    }
+    let value = strip_markers(value);
+    let directive = parse_sandbox_value(&value)?;
+    Ok(Some(directive))
 }
 
 #[allow(dead_code)]

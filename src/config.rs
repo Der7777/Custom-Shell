@@ -4,7 +4,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::parse::{OPERATOR_TOKEN_MARKER, parse_line};
+use crate::execution::{SandboxConfig, apply_sandbox_directive};
+use crate::parse::{OPERATOR_TOKEN_MARKER, parse_line, parse_sandbox_value};
 use crate::utils::is_valid_var_name;
 
 pub fn build_prompt(
@@ -49,6 +50,7 @@ pub fn apply_aliases(tokens: Vec<String>, aliases: &HashMap<String, Vec<String>>
 pub fn load_config(
     aliases: &mut HashMap<String, Vec<String>>,
     prompt_template: &mut Option<String>,
+    sandbox: &mut SandboxConfig,
 ) -> io::Result<()> {
     let Some(home) = env::var("HOME").ok() else {
         return Ok(());
@@ -82,6 +84,13 @@ pub fn load_config(
             let value = strip_quotes(value.trim());
             if key.eq_ignore_ascii_case("prompt") || key == "PROMPT" {
                 *prompt_template = Some(value.to_string());
+                continue;
+            }
+            if key.eq_ignore_ascii_case("sandbox") {
+                match parse_sandbox_value(value) {
+                    Ok(directive) => apply_sandbox_directive(sandbox, directive),
+                    Err(err) => eprintln!("config:{}: {err}", idx + 1),
+                }
                 continue;
             }
             if let Err(err) = parse_assignment(line, idx + 1) {

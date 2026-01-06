@@ -26,18 +26,38 @@ use builtins::{execute_builtin, execute_builtin_substitution, is_builtin, try_ex
 use completion::LineHelper;
 use config::{apply_aliases, build_prompt, load_config};
 use execution::{
-    build_command, run_pipeline, run_pipeline_capture, spawn_command_background,
-    spawn_pipeline_background, status_from_error,
+    SandboxConfig, apply_sandbox_directive, build_command, run_pipeline, run_pipeline_capture,
+    sandbox_options_for_command, spawn_command_background, spawn_pipeline_background,
+    status_from_error,
 };
 use expansion::{ExpansionContext, expand_globs, expand_tokens};
 use io_helpers::{normalize_command_output, read_input_line};
 use job_control::{Job, JobStatus, WaitOutcome, add_job_with_status, reap_jobs};
 use signals::{init_session, install_signal_handlers};
 
-use parse::{CommandSpec, SeqOp, parse_line, split_pipeline, split_sequence};
+use parse::{CommandSpec, SeqOp, SandboxDirective, parse_line, parse_sandbox_value, split_pipeline, split_sequence};
 
 fn main() {
     init_logging();
+    let mut trace = false;
+    let mut sandbox_override: Option<SandboxDirective> = None;
+    for arg in env::args().skip(1) {
+        if arg == "-x" {
+            trace = true;
+        } else if arg == "--sandbox" {
+            sandbox_override = Some(SandboxDirective::Enable);
+        } else if arg == "--no-sandbox" {
+            sandbox_override = Some(SandboxDirective::Disable);
+        } else if let Some(value) = arg.strip_prefix("--sandbox=") {
+            match parse_sandbox_value(value) {
+                Ok(directive) => sandbox_override = Some(directive),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return;
+                }
+            }
+        }
+    }
     let fg_pgid = Arc::new(AtomicI32::new(0));
     let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
     if let Err(err) = install_signal_handlers() {
@@ -81,15 +101,18 @@ fn main() {
         last_status: 0,
         pipefail: false,
         interactive,
-        trace: false,
+        trace,
+        sandbox: SandboxConfig::default(),
     };
-    for arg in env::args().skip(1) {
-        if arg == "-x" {
-            state.trace = true;
-        }
-    }
-    if let Err(err) = load_config(&mut state.aliases, &mut state.prompt_template) {
+    if let Err(err) = load_config(
+        &mut state.aliases,
+        &mut state.prompt_template,
+        &mut state.sandbox,
+    ) {
         eprintln!("config error: {err}");
+    }
+    if let Some(directive) = sandbox_override {
+        apply_sandbox_directive(&mut state.sandbox, directive);
     }
     if let Err(err) = flag::register(SIGCHLD, Arc::clone(&state.sigchld_flag)) {
         eprintln!("error: {err}");
@@ -166,7 +189,11 @@ fn run_once(state: &mut ShellState) -> io::Result<()> {
         }
     }
 
-    let ctx = build_expansion_context(Arc::clone(&state.fg_pgid), state.trace);
+    let ctx = build_expansion_context(
+        Arc::clone(&state.fg_pgid),
+        state.trace,
+        state.sandbox.clone(),
+    );
     let expanded = match expand_tokens(tokens, &ctx) {
         Ok(v) => v,
         Err(msg) => {
@@ -251,10 +278,11 @@ pub(crate) fn execute_segment(
         }
         let job_count = pipeline.len();
         let (job_pgid, last_pid) = if pipeline.len() > 1 {
-            spawn_pipeline_background(&pipeline, state.trace)?
+            spawn_pipeline_background(&pipeline, state.trace, &state.sandbox)?
         } else {
             let mut command = build_command(&pipeline[0])?;
-            spawn_command_background(&mut command, state.trace)?
+            let sandbox = sandbox_options_for_command(&pipeline[0], &state.sandbox, state.trace);
+            spawn_command_background(&mut command, state.trace, sandbox)?
         };
         let job_id = add_job_with_status(
             &mut state.jobs,
@@ -279,7 +307,13 @@ pub(crate) fn execute_segment(
             state.last_status = 2;
             return Ok(());
         }
-        match run_pipeline(&pipeline, &state.fg_pgid, state.shell_pgid, state.trace) {
+        match run_pipeline(
+            &pipeline,
+            &state.fg_pgid,
+            state.shell_pgid,
+            state.trace,
+            &state.sandbox,
+        ) {
             Ok(result) => {
                 if matches!(result.outcome, WaitOutcome::Stopped) {
                     let job_id = add_job_with_status(
@@ -323,6 +357,9 @@ fn trace_command_specs(state: &ShellState, pipeline: &[CommandSpec]) {
     }
     for (idx, cmd) in pipeline.iter().enumerate() {
         eprintln!("trace: argv[{idx}]: {:?}", cmd.args);
+        if let Some(directive) = cmd.sandbox {
+            eprintln!("trace: sandbox {directive:?}");
+        }
         if let Some(ref path) = cmd.stdin {
             eprintln!("trace: redirect stdin < {}", path);
         }
@@ -344,12 +381,13 @@ fn execute_command_substitution(
     inner: &str,
     fg_pgid: &Arc<AtomicI32>,
     trace: bool,
+    sandbox: SandboxConfig,
 ) -> Result<String, String> {
     let tokens = parse_line(inner)?;
     if tokens.is_empty() {
         return Ok(String::new());
     }
-    let ctx = build_expansion_context(Arc::clone(fg_pgid), trace);
+    let ctx = build_expansion_context(Arc::clone(fg_pgid), trace, sandbox.clone());
     let expanded = expand_tokens(tokens, &ctx)?;
     if expanded.is_empty() {
         return Ok(String::new());
@@ -384,7 +422,7 @@ fn execute_command_substitution(
             last_status = status;
             continue;
         }
-        let result = run_pipeline_capture(&pipeline, fg_pgid, trace)
+        let result = run_pipeline_capture(&pipeline, fg_pgid, trace, &sandbox)
             .map_err(|err| format!("command substitution failed: {err}"))?;
         output.push_str(&result.output);
         last_status = result.status_code;
@@ -396,10 +434,13 @@ fn execute_command_substitution(
 pub(crate) fn build_expansion_context(
     fg_pgid: Arc<AtomicI32>,
     trace: bool,
+    sandbox: SandboxConfig,
 ) -> ExpansionContext<'static> {
     ExpansionContext {
         lookup_var: Box::new(|name| env::var(name).ok()),
-        command_subst: Box::new(move |inner| execute_command_substitution(inner, &fg_pgid, trace)),
+        command_subst: Box::new(move |inner| {
+            execute_command_substitution(inner, &fg_pgid, trace, sandbox.clone())
+        }),
     }
 }
 
@@ -417,4 +458,5 @@ struct ShellState {
     pipefail: bool,
     interactive: bool,
     trace: bool,
+    sandbox: SandboxConfig,
 }

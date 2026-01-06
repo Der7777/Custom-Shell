@@ -21,6 +21,7 @@ default = ["shell"]
 expansion = ["glob"]
 shell = ["expansion", "rustyline", "signal-hook", "libc", "nix", "log", "env_logger"]
 pty-tests = []
+sandbox = []
 
 [[bin]]
 name = "custom_shell"

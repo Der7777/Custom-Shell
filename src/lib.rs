@@ -8,7 +8,7 @@ mod expansion;
 mod parse;
 mod utils;
 
-pub use parse::{CommandSpec, HeredocSpec, OutputRedirection, SeqOp, SeqSegment};
+pub use parse::{CommandSpec, HeredocSpec, OutputRedirection, SandboxDirective, SeqOp, SeqSegment};
 
 /// Tokenize a shell command line into raw tokens.
 pub fn parse_tokens(input: &str) -> Result<Vec<String>, String> {

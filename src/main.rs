@@ -239,6 +239,7 @@ fn run_once(state: &mut ShellState) -> io::Result<()> {
         Arc::clone(&state.fg_pgid),
         state.trace,
         state.sandbox.clone(),
+        &[],
     );
     let expanded = match expand_tokens(tokens, &ctx) {
         Ok(v) => v,
@@ -402,7 +403,11 @@ pub(crate) fn execute_segment(
     }
 
     let cmd = &pipeline[0];
-    execute_builtin(state, cmd, display)
+    if let Some(func_tokens) = state.functions.get(&cmd.args[0]) {
+        execute_function(state, func_tokens.clone(), &cmd.args[1..])
+    } else {
+        execute_builtin(state, cmd, display)
+    }
 }
 
 pub(crate) fn trace_tokens(state: &ShellState, label: &str, tokens: &[String]) {
@@ -430,9 +435,23 @@ fn trace_command_specs(state: &ShellState, pipeline: &[CommandSpec]) {
                 eprintln!("trace: redirect stdin << {}", heredoc.delimiter);
             }
         }
+        if let Some(ref content) = cmd.herestring {
+            eprintln!(
+                "trace: redirect stdin <<< ({} bytes)",
+                content.as_bytes().len()
+            );
+        }
         if let Some(ref out) = cmd.stdout {
             let mode = if out.append { ">>" } else { ">" };
             eprintln!("trace: redirect stdout {mode} {}", out.path);
+        }
+        if cmd.stderr_to_stdout {
+            eprintln!("trace: redirect stderr >&1");
+        } else if cmd.stderr_close {
+            eprintln!("trace: redirect stderr >&-");
+        } else if let Some(ref err) = cmd.stderr {
+            let mode = if err.append { ">>" } else { ">" };
+            eprintln!("trace: redirect stderr 2{mode} {}", err.path);
         }
     }
 }
@@ -447,7 +466,7 @@ fn execute_command_substitution(
     if tokens.is_empty() {
         return Ok(String::new());
     }
-    let ctx = build_expansion_context(Arc::clone(fg_pgid), trace, sandbox.clone());
+    let ctx = build_expansion_context(Arc::clone(fg_pgid), trace, sandbox.clone(), &[]);
     let expanded = expand_tokens(tokens, &ctx)?;
     if expanded.is_empty() {
         return Ok(String::new());
@@ -511,7 +530,7 @@ fn execute_tokens_capture(
     trace: bool,
     sandbox: SandboxConfig,
 ) -> Result<String, String> {
-    let ctx = build_expansion_context(Arc::clone(&fg_pgid), trace, sandbox.clone());
+    let ctx = build_expansion_context(Arc::clone(&fg_pgid), trace, sandbox.clone(), &[]);
     let expanded = expand_tokens(tokens, &ctx)?;
     if expanded.is_empty() {
         return Ok(String::new());
@@ -583,12 +602,26 @@ pub(crate) fn build_expansion_context(
     fg_pgid: Arc<AtomicI32>,
     trace: bool,
     sandbox: SandboxConfig,
+    positional: &'static [String],
 ) -> ExpansionContext<'static> {
     ExpansionContext {
-        lookup_var: Box::new(|name| env::var(name).ok()),
+        lookup_var: Box::new(move |name| {
+            if let Ok(idx) = name.parse::<usize>() {
+                if idx > 0 && idx <= positional.len() {
+                    return Some(positional[idx - 1].clone());
+                }
+            }
+            match name {
+                "#" => Some(positional.len().to_string()),
+                "*" => Some(positional.join(" ")),
+                "@" => Some(positional.join(" ")), // for now, same as *
+                _ => env::var(name).ok(),
+            }
+        }),
         command_subst: Box::new(move |inner| {
             execute_command_substitution(inner, &fg_pgid, trace, sandbox.clone())
         }),
+        positional,
     }
 }
 

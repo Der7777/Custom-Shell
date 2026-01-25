@@ -52,7 +52,11 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub stdin: Option<String>,
     pub heredoc: Option<HeredocSpec>,
+    pub herestring: Option<String>,
     pub stdout: Option<OutputRedirection>,
+    pub stderr: Option<OutputRedirection>,
+    pub stderr_to_stdout: bool,
+    pub stderr_close: bool,
     pub sandbox: Option<SandboxDirective>,
 }
 
@@ -62,7 +66,11 @@ impl CommandSpec {
             args: Vec::new(),
             stdin: None,
             heredoc: None,
+            herestring: None,
             stdout: None,
+            stderr: None,
+            stderr_to_stdout: false,
+            stderr_close: false,
             sandbox: None,
         }
     }
@@ -80,15 +88,21 @@ pub fn parse_line(input: &str) -> Result<Vec<String>, String> {
     let mut chars = input.chars().peekable();
     let mut mode = ParseMode::Normal;
     let mut in_token = false;
+    let mut expect_redir_target = false;
 
     while let Some(ch) = chars.next() {
         match mode {
             ParseMode::Normal => match ch {
+                '&' if expect_redir_target && !in_token => {
+                    in_token = true;
+                    buf.push('&');
+                }
                 ' ' | '\t' => {
                     if in_token {
                         args.push(buf.clone());
                         buf.clear();
                         in_token = false;
+                        expect_redir_target = false;
                     }
                 }
                 '#' => {
@@ -102,6 +116,7 @@ pub fn parse_line(input: &str) -> Result<Vec<String>, String> {
                         args.push(buf.clone());
                         buf.clear();
                         in_token = false;
+                        expect_redir_target = false;
                     }
                     if matches!(chars.peek(), Some('|')) {
                         chars.next();
@@ -111,38 +126,100 @@ pub fn parse_line(input: &str) -> Result<Vec<String>, String> {
                     }
                 }
                 '>' => {
+                    let fd_prefix = if in_token && buf.chars().all(|c| c.is_ascii_digit()) {
+                        let prefix = buf.clone();
+                        buf.clear();
+                        in_token = false;
+                        expect_redir_target = false;
+                        Some(prefix)
+                    } else {
+                        None
+                    };
                     if in_token {
                         args.push(buf.clone());
                         buf.clear();
                         in_token = false;
+                        expect_redir_target = false;
                     }
                     if matches!(chars.peek(), Some('>')) {
                         chars.next();
-                        args.push(format!("{OPERATOR_TOKEN_MARKER}>>"));
+                        let op = if let Some(prefix) = fd_prefix {
+                            format!("{prefix}>>")
+                        } else {
+                            ">>".to_string()
+                        };
+                        args.push(format!("{OPERATOR_TOKEN_MARKER}{op}"));
                     } else {
-                        args.push(format!("{OPERATOR_TOKEN_MARKER}>"));
+                        let op = if let Some(prefix) = fd_prefix {
+                            format!("{prefix}>")
+                        } else {
+                            ">".to_string()
+                        };
+                        args.push(format!("{OPERATOR_TOKEN_MARKER}{op}"));
                     }
+                    expect_redir_target = true;
                 }
                 '<' => {
+                    let fd_prefix = if in_token && buf.chars().all(|c| c.is_ascii_digit()) {
+                        let prefix = buf.clone();
+                        buf.clear();
+                        in_token = false;
+                        expect_redir_target = false;
+                        Some(prefix)
+                    } else {
+                        None
+                    };
                     if in_token {
                         args.push(buf.clone());
                         buf.clear();
                         in_token = false;
+                        expect_redir_target = false;
                     }
                     if matches!(chars.peek(), Some('<')) {
                         chars.next();
-                        args.push(format!("{OPERATOR_TOKEN_MARKER}<<"));
+                        if matches!(chars.peek(), Some('<')) {
+                            chars.next();
+                            let op = if let Some(prefix) = fd_prefix {
+                                format!("{prefix}<<<")
+                            } else {
+                                "<<<".to_string()
+                            };
+                            args.push(format!("{OPERATOR_TOKEN_MARKER}{op}"));
+                        } else {
+                            let op = if let Some(prefix) = fd_prefix {
+                                format!("{prefix}<<")
+                            } else {
+                                "<<".to_string()
+                            };
+                            args.push(format!("{OPERATOR_TOKEN_MARKER}{op}"));
+                        }
                     } else {
-                        args.push(format!("{OPERATOR_TOKEN_MARKER}<"));
+                        let op = if let Some(prefix) = fd_prefix {
+                            format!("{prefix}<")
+                        } else {
+                            "<".to_string()
+                        };
+                        args.push(format!("{OPERATOR_TOKEN_MARKER}{op}"));
                     }
+                    expect_redir_target = true;
                 }
                 '&' => {
                     if in_token {
                         args.push(buf.clone());
                         buf.clear();
                         in_token = false;
+                        expect_redir_target = false;
                     }
-                    if matches!(chars.peek(), Some('&')) {
+                    if matches!(chars.peek(), Some('>')) {
+                        chars.next();
+                        if matches!(chars.peek(), Some('>')) {
+                            chars.next();
+                            args.push(format!("{OPERATOR_TOKEN_MARKER}&>>"));
+                        } else {
+                            args.push(format!("{OPERATOR_TOKEN_MARKER}&>"));
+                        }
+                        expect_redir_target = true;
+                    } else if matches!(chars.peek(), Some('&')) {
                         chars.next();
                         args.push(format!("{OPERATOR_TOKEN_MARKER}&&"));
                     } else {
@@ -154,6 +231,7 @@ pub fn parse_line(input: &str) -> Result<Vec<String>, String> {
                         args.push(buf.clone());
                         buf.clear();
                         in_token = false;
+                        expect_redir_target = false;
                     }
                     args.push(format!("{OPERATOR_TOKEN_MARKER};"));
                 }
@@ -255,6 +333,11 @@ pub fn parse_line(input: &str) -> Result<Vec<String>, String> {
 
     if in_token {
         args.push(buf);
+        expect_redir_target = false;
+    }
+
+    if expect_redir_target {
+        return Err("missing redirection target".to_string());
     }
 
     Ok(args)
@@ -472,41 +555,11 @@ pub fn split_pipeline(tokens: Vec<String>) -> Result<(Vec<CommandSpec>, bool), S
                     pipeline.push(current);
                     current = CommandSpec::new();
                 }
-                "<" => {
-                    let path = iter
-                        .next()
-                        .ok_or_else(|| "missing input file".to_string())?;
-                    if current.stdin.is_some() || current.heredoc.is_some() {
-                        return Err("multiple input redirections".to_string());
-                    }
-                    current.stdin = Some(path);
-                }
-                "<<" => {
-                    let raw = iter
-                        .next()
-                        .ok_or_else(|| "missing heredoc delimiter".to_string())?;
-                    if current.stdin.is_some() || current.heredoc.is_some() {
-                        return Err("multiple input redirections".to_string());
-                    }
-                    let quoted = raw.contains(ESCAPE_MARKER) || raw.contains(NOGLOB_MARKER);
-                    let delimiter = strip_markers(&raw);
-                    current.heredoc = Some(HeredocSpec {
-                        delimiter,
-                        quoted,
-                        content: None,
-                    });
-                }
-                ">" | ">>" => {
-                    let path = iter
-                        .next()
-                        .ok_or_else(|| "missing output file".to_string())?;
-                    if current.stdout.is_some() {
-                        return Err("multiple output redirections".to_string());
-                    }
-                    current.stdout = Some(OutputRedirection {
-                        path,
-                        append: stripped == ">>",
-                    });
+                "<" | "<<" | "<<<" | ">" | ">>" | "&>" | "&>>"
+                | "0<" | "0<<" | "0<<<"
+                | "1>" | "1>>"
+                | "2>" | "2>>" => {
+                    apply_redirection(&mut current, stripped, &mut iter)?;
                 }
                 "&" => {
                     if iter.peek().is_some() {
@@ -541,6 +594,141 @@ pub fn split_pipeline(tokens: Vec<String>) -> Result<(Vec<CommandSpec>, bool), S
 
     pipeline.push(current);
     Ok((pipeline, background))
+}
+
+fn apply_redirection(
+    current: &mut CommandSpec,
+    op: &str,
+    iter: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<(), String> {
+    match op {
+        "<" | "0<" => {
+            let path = iter
+                .next()
+                .ok_or_else(|| "missing input file".to_string())?;
+            set_input_redirection(current, InputRedirection::File(path))
+        }
+        "<<" | "0<<" => {
+            let raw = iter
+                .next()
+                .ok_or_else(|| "missing heredoc delimiter".to_string())?;
+            let quoted = raw.contains(ESCAPE_MARKER) || raw.contains(NOGLOB_MARKER);
+            let delimiter = strip_markers(&raw);
+            set_input_redirection(
+                current,
+                InputRedirection::Heredoc(HeredocSpec {
+                    delimiter,
+                    quoted,
+                    content: None,
+                }),
+            )
+        }
+        "<<<" | "0<<<" => {
+            let raw = iter
+                .next()
+                .ok_or_else(|| "missing here-string value".to_string())?;
+            let content = strip_markers(&raw);
+            set_input_redirection(current, InputRedirection::HereString(content))
+        }
+        ">" | "1>" | ">>" | "1>>" => {
+            let path = iter
+                .next()
+                .ok_or_else(|| "missing output file".to_string())?;
+            if current.stdout.is_some() {
+                return Err("multiple output redirections".to_string());
+            }
+            current.stdout = Some(OutputRedirection {
+                path,
+                append: op.ends_with(">>"),
+            });
+            Ok(())
+        }
+        "2>" | "2>>" => {
+            let target = iter
+                .next()
+                .ok_or_else(|| "missing output file".to_string())?;
+            if let Some((dup, close)) = parse_dup_target(&target)? {
+                if dup == 1 {
+                    current.stderr_to_stdout = true;
+                    current.stderr_close = false;
+                    current.stderr = None;
+                    Ok(())
+                } else if close {
+                    current.stderr_close = true;
+                    current.stderr_to_stdout = false;
+                    current.stderr = None;
+                    Ok(())
+                } else {
+                    Err("unsupported fd redirection".to_string())
+                }
+            } else {
+                if current.stderr.is_some() {
+                    return Err("multiple stderr redirections".to_string());
+                }
+                current.stderr = Some(OutputRedirection {
+                    path: target,
+                    append: op.ends_with(">>"),
+                });
+                current.stderr_to_stdout = false;
+                current.stderr_close = false;
+                Ok(())
+            }
+        }
+        "&>" | "&>>" => {
+            let path = iter
+                .next()
+                .ok_or_else(|| "missing output file".to_string())?;
+            if current.stdout.is_some() || current.stderr.is_some() {
+                return Err("multiple output redirections".to_string());
+            }
+            current.stdout = Some(OutputRedirection {
+                path: path.clone(),
+                append: op.ends_with(">>"),
+            });
+            current.stderr = Some(OutputRedirection {
+                path,
+                append: op.ends_with(">>"),
+            });
+            current.stderr_to_stdout = false;
+            current.stderr_close = false;
+            Ok(())
+        }
+        _ => Err("unsupported redirection".to_string()),
+    }
+}
+
+enum InputRedirection {
+    File(String),
+    Heredoc(HeredocSpec),
+    HereString(String),
+}
+
+fn set_input_redirection(current: &mut CommandSpec, input: InputRedirection) -> Result<(), String> {
+    if current.stdin.is_some() || current.heredoc.is_some() || current.herestring.is_some() {
+        return Err("multiple input redirections".to_string());
+    }
+    match input {
+        InputRedirection::File(path) => current.stdin = Some(path),
+        InputRedirection::Heredoc(spec) => current.heredoc = Some(spec),
+        InputRedirection::HereString(content) => current.herestring = Some(content),
+    }
+    Ok(())
+}
+
+fn parse_dup_target(target: &str) -> Result<Option<(i32, bool)>, String> {
+    let Some(rest) = target.strip_prefix('&') else {
+        return Ok(None);
+    };
+    if rest == "-" {
+        return Ok(Some((0, true)));
+    }
+    if rest.chars().all(|c| c.is_ascii_digit()) {
+        let fd = rest
+            .parse::<i32>()
+            .map_err(|_| "invalid fd redirection".to_string())?;
+        return Ok(Some((fd, false)));
+    }
+    Err("invalid fd redirection".to_string())
 }
 
 pub fn parse_sandbox_value(value: &str) -> Result<SandboxDirective, String> {
@@ -698,6 +886,23 @@ mod tests {
         let tokens = parse_line("cmd >> out").unwrap();
         let (pipeline, _) = split_pipeline(tokens).unwrap();
         assert!(pipeline[0].stdout.as_ref().unwrap().append);
+
+        let tokens = parse_line("cmd 2> err").unwrap();
+        let (pipeline, _) = split_pipeline(tokens).unwrap();
+        assert_eq!(pipeline[0].stderr.as_ref().unwrap().path, "err");
+
+        let tokens = parse_line("cmd 2>&1").unwrap();
+        let (pipeline, _) = split_pipeline(tokens).unwrap();
+        assert!(pipeline[0].stderr_to_stdout);
+
+        let tokens = parse_line("cmd &> both").unwrap();
+        let (pipeline, _) = split_pipeline(tokens).unwrap();
+        assert_eq!(pipeline[0].stdout.as_ref().unwrap().path, "both");
+        assert_eq!(pipeline[0].stderr.as_ref().unwrap().path, "both");
+
+        let tokens = parse_line("cmd <<< value").unwrap();
+        let (pipeline, _) = split_pipeline(tokens).unwrap();
+        assert_eq!(pipeline[0].herestring.as_deref(), Some("value"));
 
         let tokens = parse_line("cmd & other").unwrap();
         assert_eq!(

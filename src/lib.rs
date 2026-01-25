@@ -44,6 +44,7 @@ pub fn fuzz_expand_bytes(data: &[u8]) {
     let ctx = ExpansionContext {
         lookup_var: Box::new(|_| Some(String::new())),
         command_subst: Box::new(|_| Ok(String::new())),
+        positional: &[],
     };
     if let Ok(tokens) = parse::parse_line(&input) {
         if let Ok(tokens) = expansion::expand_tokens(tokens, &ctx) {

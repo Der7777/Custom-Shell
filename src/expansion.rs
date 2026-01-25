@@ -11,6 +11,7 @@ type CommandSubst<'a> = Box<dyn Fn(&str) -> Result<String, String> + 'a>;
 pub struct ExpansionContext<'a> {
     pub lookup_var: LookupVar<'a>,
     pub command_subst: CommandSubst<'a>,
+    pub positional: &'a [String],
 }
 
 pub fn expand_tokens(

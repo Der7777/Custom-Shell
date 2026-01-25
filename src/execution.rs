@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicI32, Ordering},
@@ -9,7 +10,7 @@ use std::sync::{
 };
 
 use log::debug;
-use nix::unistd::{pipe, write};
+use nix::unistd::{close, dup2, pipe, write};
 #[cfg(feature = "sandbox")]
 use std::ffi::CString;
 #[cfg(feature = "sandbox")]
@@ -146,7 +147,7 @@ pub fn run_pipeline_capture(
         command.args(&cmd.args[1..]);
 
         if let Some(stdout) = prev_stdout.take() {
-            if cmd.stdin.is_none() && cmd.heredoc.is_none() {
+            if cmd.stdin.is_none() && cmd.heredoc.is_none() && cmd.herestring.is_none() {
                 command.stdin(Stdio::from(stdout));
             }
         }
@@ -171,6 +172,7 @@ pub fn run_pipeline_capture(
         } else {
             command.stdout(Stdio::piped());
         }
+        apply_stderr_redirection(&mut command, cmd)?;
 
         if let Some(id) = pgid {
             set_process_group_explicit(&mut command, id);
@@ -252,7 +254,7 @@ pub fn run_pipeline(
         command.args(&cmd.args[1..]);
 
         if let Some(stdout) = prev_stdout.take() {
-            if cmd.stdin.is_none() && cmd.heredoc.is_none() {
+            if cmd.stdin.is_none() && cmd.heredoc.is_none() && cmd.herestring.is_none() {
                 command.stdin(Stdio::from(stdout));
             }
         }
@@ -272,6 +274,7 @@ pub fn run_pipeline(
             let file = opts.open(&output.path)?;
             command.stdout(Stdio::from(file));
         }
+        apply_stderr_redirection(&mut command, cmd)?;
 
         if let Some(id) = pgid {
             set_process_group_explicit(&mut command, id);
@@ -351,7 +354,7 @@ pub fn spawn_pipeline_background(
         command.args(&cmd.args[1..]);
 
         if let Some(stdout) = prev_stdout.take() {
-            if cmd.stdin.is_none() && cmd.heredoc.is_none() {
+            if cmd.stdin.is_none() && cmd.heredoc.is_none() && cmd.herestring.is_none() {
                 command.stdin(Stdio::from(stdout));
             }
         }
@@ -371,6 +374,7 @@ pub fn spawn_pipeline_background(
             let file = opts.open(&output.path)?;
             command.stdout(Stdio::from(file));
         }
+        apply_stderr_redirection(&mut command, cmd)?;
 
         if let Some(id) = pgid {
             set_process_group_explicit(&mut command, id);
@@ -420,7 +424,7 @@ pub fn spawn_pipeline_sandboxed(
         command.args(&cmd.args[1..]);
 
         if let Some(stdout) = prev_stdout.take() {
-            if cmd.stdin.is_none() && cmd.heredoc.is_none() {
+            if cmd.stdin.is_none() && cmd.heredoc.is_none() && cmd.herestring.is_none() {
                 command.stdin(Stdio::from(stdout));
             }
         }
@@ -440,6 +444,7 @@ pub fn spawn_pipeline_sandboxed(
             let file = opts.open(&output.path)?;
             command.stdout(Stdio::from(file));
         }
+        apply_stderr_redirection(&mut command, cmd)?;
 
         if let Some(id) = pgid {
             set_process_group_explicit(&mut command, id);
@@ -581,12 +586,13 @@ pub fn build_command(cmd: &CommandSpec) -> io::Result<Command> {
         let file = opts.open(&output.path)?;
         command.stdout(Stdio::from(file));
     }
+    apply_stderr_redirection(&mut command, cmd)?;
 
     Ok(command)
 }
 
 pub fn apply_input_redirection(command: &mut Command, cmd: &CommandSpec) -> io::Result<()> {
-    if cmd.stdin.is_some() && cmd.heredoc.is_some() {
+    if input_redirection_count(cmd) > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "multiple input redirections",
@@ -604,6 +610,9 @@ pub fn apply_input_redirection(command: &mut Command, cmd: &CommandSpec) -> io::
             ));
         };
         command.stdin(heredoc_stdin(content)?);
+    }
+    if let Some(ref content) = cmd.herestring {
+        command.stdin(here_string_stdin(content)?);
     }
     Ok(())
 }
@@ -628,6 +637,60 @@ fn heredoc_stdin(content: &str) -> io::Result<Stdio> {
     Ok(Stdio::from(file))
 }
 
+fn here_string_stdin(content: &str) -> io::Result<Stdio> {
+    let mut buf = String::from(content);
+    buf.push('\n');
+    heredoc_stdin(&buf)
+}
+
+fn input_redirection_count(cmd: &CommandSpec) -> usize {
+    let mut count = 0usize;
+    if cmd.stdin.is_some() {
+        count += 1;
+    }
+    if cmd.heredoc.is_some() {
+        count += 1;
+    }
+    if cmd.herestring.is_some() {
+        count += 1;
+    }
+    count
+}
+
+fn apply_stderr_redirection(command: &mut Command, cmd: &CommandSpec) -> io::Result<()> {
+    if cmd.stderr_close {
+        unsafe {
+            command.pre_exec(|| {
+                close(2).map_err(|err| io::Error::other(err.to_string()))?;
+                Ok(())
+            });
+        }
+        return Ok(());
+    }
+
+    if cmd.stderr_to_stdout {
+        unsafe {
+            command.pre_exec(|| {
+                dup2(1, 2).map_err(|err| io::Error::other(err.to_string()))?;
+                Ok(())
+            });
+        }
+        return Ok(());
+    }
+
+    if let Some(ref err) = cmd.stderr {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true);
+        if err.append {
+            opts.append(true);
+        } else {
+            opts.truncate(true);
+        }
+        let file = opts.open(&err.path)?;
+        command.stderr(Stdio::from(file));
+    }
+    Ok(())
+}
 fn apply_sandbox(command: &mut Command, options: &SandboxOptions) -> io::Result<()> {
     #[cfg(feature = "sandbox")]
     {
@@ -791,6 +854,21 @@ mod tests {
 
         match run_cat_with_spec(spec) {
             Ok(output) => assert_eq!(output, "line1\nline2\n"),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                eprintln!("cat not found; skipping test");
+            }
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn here_string_pipes_content() {
+        let mut spec = CommandSpec::new();
+        spec.args = vec!["cat".to_string()];
+        spec.herestring = Some("line1".to_string());
+
+        match run_cat_with_spec(spec) {
+            Ok(output) => assert_eq!(output, "line1\n"),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 eprintln!("cat not found; skipping test");
             }

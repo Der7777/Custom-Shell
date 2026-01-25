@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::{
@@ -17,26 +17,31 @@ use nix::unistd::{setpgid, tcsetpgrp, Pid};
 
 pub fn set_process_group(command: &mut Command, fg_pgid: &Arc<AtomicI32>) {
     let fg_pgid = Arc::clone(fg_pgid);
-    unsafe {
-        command.pre_exec(move || {
-            reset_ignored_signals()?;
-            let pgid = fg_pgid.load(Ordering::SeqCst);
-            let target = if pgid == 0 { 0 } else { pgid };
-            setpgid(Pid::from_raw(0), Pid::from_raw(target))
-                .map_err(|err| io::Error::other(err.to_string()))?;
-            Ok(())
-        });
-    }
+    set_pre_exec(command, move || {
+        reset_ignored_signals()?;
+        let pgid = fg_pgid.load(Ordering::SeqCst);
+        let target = if pgid == 0 { 0 } else { pgid };
+        setpgid(Pid::from_raw(0), Pid::from_raw(target))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(())
+    });
 }
 
 pub fn set_process_group_explicit(command: &mut Command, pgid: i32) {
+    set_pre_exec(command, move || {
+        reset_ignored_signals()?;
+        setpgid(Pid::from_raw(0), Pid::from_raw(pgid))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(())
+    });
+}
+
+fn set_pre_exec<F>(command: &mut Command, f: F)
+where
+    F: FnMut() -> io::Result<()> + Send + Sync + 'static,
+{
     unsafe {
-        command.pre_exec(move || {
-            reset_ignored_signals()?;
-            setpgid(Pid::from_raw(0), Pid::from_raw(pgid))
-                .map_err(|err| io::Error::other(err.to_string()))?;
-            Ok(())
-        });
+        command.pre_exec(f);
     }
 }
 
@@ -54,7 +59,8 @@ fn reset_ignored_signals() -> io::Result<()> {
 }
 
 pub fn set_terminal_foreground(pgid: i32) -> io::Result<()> {
-    let fd = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+    let stdin = std::io::stdin();
+    let fd = stdin.as_fd();
     match tcsetpgrp(fd, Pid::from_raw(pgid)) {
         Ok(()) => Ok(()),
         Err(nix::errno::Errno::ENOTTY) => Ok(()),
@@ -93,7 +99,11 @@ pub struct TermiosGuard {
 impl TermiosGuard {
     pub fn new() -> Self {
         Self {
-            saved: tcgetattr(unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) }).ok(),
+            saved: {
+                let stdin = std::io::stdin();
+                let fd = stdin.as_fd();
+                tcgetattr(fd).ok()
+            },
         }
     }
 }
@@ -101,7 +111,8 @@ impl TermiosGuard {
 impl Drop for TermiosGuard {
     fn drop(&mut self) {
         if let Some(ref termios) = self.saved {
-            let fd = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+            let stdin = std::io::stdin();
+            let fd = stdin.as_fd();
             if let Err(err) = tcsetattr(fd, SetArg::TCSANOW, termios) {
                 warn!("termios event=restore error={}", err);
             }
@@ -141,12 +152,14 @@ impl Drop for TerminalGuard {
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum JobStatus {
+    // Stopped jobs must be resumed explicitly via fg/bg.
     Running,
     Stopped,
 }
 
 pub struct Job {
     pub id: usize,
+    // Job id is user-facing; a job can map to multiple process IDs.
     pub pgid: i32,
     pub last_pid: i32,
     pub count: usize,
@@ -363,6 +376,7 @@ pub fn wait_for_process_group(
 }
 
 pub fn reap_jobs(jobs: &mut Vec<Job>) {
+    // Reaping runs outside the signal handler to keep handlers async-safe.
     let mut index = 0;
     while index < jobs.len() {
         let pgid = jobs[index].pgid;

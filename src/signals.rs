@@ -1,7 +1,10 @@
 use std::io;
 
 use log::debug;
+use nix::errno::Errno;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::unistd::{getpgrp, getpid, getsid, setpgid, setsid, tcsetpgrp, Pid};
+use std::os::fd::AsFd;
 
 pub fn install_signal_handlers() -> io::Result<()> {
     let action = SigAction::new(SigHandler::SigIgn, SaFlags::SA_RESTART, SigSet::empty());
@@ -15,35 +18,31 @@ pub fn install_signal_handlers() -> io::Result<()> {
 }
 
 pub fn init_session(interactive: bool) -> io::Result<i32> {
-    let pid = unsafe { libc::getpid() };
+    let pid = getpid();
     if !interactive {
-        let sid = unsafe { libc::getsid(0) };
+        let sid = getsid(None).map_err(|err| io::Error::other(err.to_string()))?;
         if sid != pid {
-            let rc = unsafe { libc::setsid() };
-            if rc < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EPERM) {
-                    return Err(err);
+            if let Err(err) = setsid() {
+                if err != Errno::EPERM {
+                    return Err(io::Error::other(err.to_string()));
                 }
             }
         }
     }
-    let pgid = unsafe { libc::getpgrp() };
+    let pgid = getpgrp();
     if interactive && pgid != pid {
-        let rc = unsafe { libc::setpgid(0, 0) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
+        setpgid(Pid::from_raw(0), Pid::from_raw(0))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+    }
+    let pgid = getpgrp();
+    let stdin = std::io::stdin();
+    let fd = stdin.as_fd();
+    if let Err(err) = tcsetpgrp(fd, pgid) {
+        if err != Errno::ENOTTY {
+            return Err(io::Error::other(err.to_string()));
         }
     }
-    let pgid = unsafe { libc::getpgrp() };
-    let rc = unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, pgid) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ENOTTY) {
-            return Err(err);
-        }
-    }
-    Ok(pgid)
+    Ok(pgid.as_raw())
 }
 
 fn install_action(signal: Signal, action: &SigAction) -> io::Result<()> {

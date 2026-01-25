@@ -23,6 +23,34 @@ When built with the `expansion` feature, it also exports:
 - `expand_globs`
 - `glob_pattern`
 
+## Module overview
+
+- `src/repl.rs`: interactive loop, editor integration, and top-level shell state.
+- `src/parse/`: tokenization, command parsing, and redirection parsing.
+- `src/expansion/`: parameter/command substitution and glob expansion.
+- `src/execution/`: spawning, redirection plumbing, pipelines, and sandbox adapters.
+- `src/builtins/`: core builtins, control flow, scripting helpers, and config commands.
+- `src/job_control.rs`: job tracking, process groups, and SIGCHLD handling.
+
+## Implementation notes
+
+- `src/repl.rs` owns the interactive loop, state, and job tracking. Each input line is parsed
+  into a sequence, then expanded and executed segment-by-segment to preserve `&&/||` semantics.
+- `src/parse/` splits tokenization, command parsing, and redirection parsing. Operator tokens
+  are marked with a sentinel byte to preserve exact operator boundaries through expansion.
+- `src/expansion/` handles parameter/command substitution and glob expansion. Globs are
+  expanded after parameter substitution to avoid accidental globbing in quoted segments.
+- `src/execution/` contains pipeline orchestration, spawning, and sandbox adapters. Foreground
+  jobs use a process group so job control (fg/bg, stops) behaves predictably.
+
+## Marker system
+
+The parser uses three marker bytes to preserve intent across phases:
+
+- `OPERATOR_TOKEN_MARKER` prefixes operator tokens so operators survive expansion unchanged.
+- `NOGLOB_MARKER` tags characters that must not be globbed (for example, from double quotes).
+- `ESCAPE_MARKER` records escaped literals so they stay literal through expansion.
+
 ## Test
 
 ```
@@ -59,4 +87,11 @@ Command substitution runs with the full environment and privileges of the shell 
 
 GitHub Actions runs `cargo fmt --check`, `cargo clippy`, and `cargo test` on push/PR.
 
-Also if your reading this your probably a nerd, like just figure it out
+If you're reading this, you're probably a nerd. Feel free to explore the code!
+
+## Troubleshooting
+
+- `parse error: missing redirection target`: a redirection operator has no following path.
+- `pipes only work with external commands`: builtins do not run in pipelines here.
+- `background jobs only work with external commands`: builtins cannot be backgrounded.
+- `config: unknown theme`: check `prompt_theme` value in `~/.minishellrc`.

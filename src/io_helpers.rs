@@ -5,6 +5,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 
 use crate::completion::LineHelper;
+use crate::error::{ErrorKind, ShellError};
 
 pub fn read_input_line(
     editor: &mut Editor<LineHelper, DefaultHistory>,
@@ -34,11 +35,17 @@ pub fn read_heredoc(
     interactive: bool,
     delimiter: &str,
 ) -> Result<String, String> {
+    // Heredoc content is collected after parsing to allow interactive input.
     let mut content = String::new();
     loop {
         if interactive {
             let Some(editor) = editor.as_deref_mut() else {
-                return Err("heredoc reader not available".to_string());
+                return Err(ShellError::new(
+                    ErrorKind::Parse,
+                    "Heredoc reader not available in non-interactive mode".to_string(),
+                )
+                .with_context("Cannot read heredoc content interactively")
+                .into());
             };
             match editor.readline("> ") {
                 Ok(line) => {
@@ -49,22 +56,46 @@ pub fn read_heredoc(
                     content.push('\n');
                 }
                 Err(ReadlineError::Eof) => {
-                    return Err("unexpected EOF while reading heredoc".to_string());
+                    return Err(ShellError::new(
+                        ErrorKind::Parse,
+                        format!("Unexpected EOF while reading heredoc (expected delimiter: {})", delimiter),
+                    )
+                    .with_context("Heredoc was not terminated with expected delimiter")
+                    .into());
                 }
                 Err(ReadlineError::Interrupted) => {
-                    return Err("heredoc interrupted".to_string());
+                    return Err(ShellError::new(
+                        ErrorKind::Parse,
+                        "Heredoc input interrupted (Ctrl-C)".to_string(),
+                    )
+                    .into());
                 }
                 Err(err) => {
-                    return Err(format!("heredoc error: {err}"));
+                    return Err(ShellError::new(
+                        ErrorKind::Parse,
+                        format!("Error reading heredoc: {}", err),
+                    )
+                    .into());
                 }
             }
         } else {
             let mut line = String::new();
             let bytes = io::stdin()
                 .read_line(&mut line)
-                .map_err(|err| format!("heredoc error: {err}"))?;
+                .map_err(|err| {
+                    ShellError::new(
+                        ErrorKind::Parse,
+                        format!("Error reading heredoc from stdin: {}", err),
+                    )
+                    .into()
+                })?;
             if bytes == 0 {
-                return Err("unexpected EOF while reading heredoc".to_string());
+                return Err(ShellError::new(
+                    ErrorKind::Parse,
+                    format!("Unexpected EOF while reading heredoc (expected delimiter: {})", delimiter),
+                )
+                .with_context("Heredoc was not terminated with expected delimiter")
+                .into());
             }
             let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
             if trimmed == delimiter {

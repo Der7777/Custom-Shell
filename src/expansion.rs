@@ -1,17 +1,24 @@
-use glob::glob;
-
+//! Expansion runs in two phases: parameter/command substitution, then globbing.
+//! This ordering avoids accidental globbing inside variable values.
+use crate::error::{ErrorKind, ShellError};
 use crate::parse::{
-    parse_command_substitution, strip_markers, ESCAPE_MARKER, NOGLOB_MARKER, OPERATOR_TOKEN_MARKER,
+    parse_command_substitution, parse_command_substitution_lenient, strip_markers, ESCAPE_MARKER,
+    NOGLOB_MARKER, OPERATOR_TOKEN_MARKER,
 };
 use crate::utils::is_valid_var_name;
 
+mod glob;
+
+pub use glob::{expand_globs, glob_pattern};
 type LookupVar<'a> = Box<dyn Fn(&str) -> Option<String> + 'a>;
 type CommandSubst<'a> = Box<dyn Fn(&str) -> Result<String, String> + 'a>;
 
 pub struct ExpansionContext<'a> {
     pub lookup_var: LookupVar<'a>,
     pub command_subst: CommandSubst<'a>,
+    // Separate positional slice for function-style parameters.
     pub positional: &'a [String],
+    pub strict: bool,
 }
 
 pub fn expand_tokens(
@@ -33,6 +40,7 @@ pub fn expand_tokens(
 pub fn expand_token(token: &str, ctx: &ExpansionContext<'_>) -> Result<String, String> {
     let mut out = String::new();
     let mut chars = token.chars().peekable();
+    // Tilde expansion only applies at the start of a token.
     let mut at_start = true;
 
     while let Some(ch) = chars.next() {
@@ -44,6 +52,7 @@ pub fn expand_token(token: &str, ctx: &ExpansionContext<'_>) -> Result<String, S
             continue;
         }
         if ch == NOGLOB_MARKER {
+            // Double-quoted segments mark bytes as non-globbable.
             if let Some(next) = chars.next() {
                 if next == '$' {
                     let expanded = match expand_dollar(&mut chars, ctx)? {
@@ -99,9 +108,18 @@ where
     match chars.peek().copied() {
         Some('(') => {
             chars.next();
-            let inner = parse_command_substitution(chars)?;
-            let output = (ctx.command_subst)(&inner)?;
-            Ok(Some(output))
+            if ctx.strict {
+                let inner = parse_command_substitution(chars)?;
+                let output = (ctx.command_subst)(&inner)?;
+                Ok(Some(output))
+            } else {
+                let (inner, closed) = parse_command_substitution_lenient(chars)?;
+                if !closed {
+                    return Ok(Some(format!("$({inner}")));
+                }
+                let output = (ctx.command_subst)(&inner)?;
+                Ok(Some(output))
+            }
         }
         Some('{') => {
             chars.next();
@@ -129,12 +147,28 @@ where
                 inner.push(ch);
             }
             if !found {
-                return Err("unterminated ${...}".to_string());
+                if ctx.strict {
+                    return Err(ShellError::new(
+                        ErrorKind::Expansion,
+                        "Unterminated parameter expansion ${}".to_string(),
+                    )
+                    .with_context("Missing closing brace: ${variable}")
+                    .into());
+                }
+                return Ok(Some(format!("${{{inner}")));
             }
             let (name, fallback) = split_parameter(&inner)?;
             let name = strip_markers(name);
             if !is_valid_var_name(&name) {
-                return Err("invalid variable name".to_string());
+                if ctx.strict {
+                    return Err(ShellError::new(
+                        ErrorKind::Expansion,
+                        format!("Invalid variable name: {}", name),
+                    )
+                    .with_context("Variable names must start with a letter or underscore, followed by letters, digits, or underscores")
+                    .into());
+                }
+                return Ok(Some(format!("${{{inner}}}")));
             }
             let value = (ctx.lookup_var)(&name).filter(|v| !v.is_empty());
             if let Some(val) = value {
@@ -192,62 +226,10 @@ fn enforce_no_glob(value: &str) -> String {
     out
 }
 
-pub fn expand_globs(tokens: Vec<String>) -> Result<Vec<String>, String> {
-    let mut expanded = Vec::new();
-    for token in tokens {
-        if token.starts_with(OPERATOR_TOKEN_MARKER) {
-            expanded.push(token);
-            continue;
-        }
-        let (pattern, has_glob) = glob_pattern(&token);
-        if has_glob {
-            let mut matches = Vec::new();
-            for entry in glob(&pattern).map_err(|err| format!("glob error: {err}"))? {
-                match entry {
-                    Ok(path) => matches.push(path.display().to_string()),
-                    Err(err) => return Err(format!("glob error: {err}")),
-                }
-            }
-            if matches.is_empty() {
-                expanded.push(strip_markers(&token));
-            } else {
-                matches.sort();
-                expanded.extend(matches);
-            }
-        } else {
-            expanded.push(strip_markers(&token));
-        }
-    }
-    Ok(expanded)
-}
-
-pub fn glob_pattern(token: &str) -> (String, bool) {
-    let mut pattern = String::new();
-    let mut has_glob = false;
-    let mut chars = token.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == ESCAPE_MARKER || ch == NOGLOB_MARKER {
-            if let Some(next) = chars.next() {
-                pattern.push(next);
-            }
-            continue;
-        }
-        if ch == '*' || ch == '?' {
-            has_glob = true;
-        }
-        pattern.push(ch);
-    }
-
-    (pattern, has_glob)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
     use std::env;
-    use tempfile::tempdir;
 
     fn with_env_var<F: FnOnce()>(key: &str, value: &str, f: F) {
         let prior = env::var(key).ok();
@@ -263,6 +245,8 @@ mod tests {
         ExpansionContext {
             lookup_var: Box::new(|name| env::var(name).ok()),
             command_subst: Box::new(|_| Ok(String::new())),
+            positional: &[],
+            strict: true,
         }
     }
 
@@ -278,23 +262,6 @@ mod tests {
             let token = format!("${{{key}:-fallback}}");
             assert_eq!(expand_token(&token, &ctx).unwrap(), "value");
         });
-    }
-
-    #[test]
-    fn expand_globs_matches_and_sorts() {
-        let dir = tempdir().unwrap();
-        let p1 = dir.path().join("a.rs");
-        let p2 = dir.path().join("b.rs");
-        let p3 = dir.path().join("c.txt");
-        std::fs::write(&p1, "a").unwrap();
-        std::fs::write(&p2, "b").unwrap();
-        std::fs::write(&p3, "c").unwrap();
-
-        let pattern = format!("{}/{}.rs", dir.path().display(), "*");
-        let expanded = expand_globs(vec![pattern]).unwrap();
-        assert_eq!(expanded.len(), 2);
-        assert_eq!(expanded[0], p1.display().to_string());
-        assert_eq!(expanded[1], p2.display().to_string());
     }
 
     #[test]
@@ -315,21 +282,5 @@ mod tests {
         });
     }
 
-    proptest! {
-        #[test]
-        fn glob_pattern_no_wildcards_no_glob(s in "[^\u{1d}\u{1e}\u{1f}*?]{0,32}") {
-            let (pattern, has_glob) = glob_pattern(&s);
-            prop_assert_eq!(pattern, s);
-            prop_assert!(!has_glob);
-        }
-
-        #[test]
-        fn glob_pattern_detects_wildcards(prefix in "[^\u{1d}\u{1e}\u{1f}]{0,16}", suffix in "[^\u{1d}\u{1e}\u{1f}]{0,16}", wildcard in prop_oneof![Just('*'), Just('?')]) {
-            let mut input = prefix;
-            input.push(wildcard);
-            input.push_str(&suffix);
-            let (_, has_glob) = glob_pattern(&input);
-            prop_assert!(has_glob);
-        }
-    }
+    use tempfile::tempdir;
 }

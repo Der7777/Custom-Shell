@@ -1,28 +1,34 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Read};
-use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::process::ExitStatusExt;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicI32, Ordering},
     Arc,
 };
 
 use log::debug;
-use nix::unistd::{close, dup2, pipe, write};
-#[cfg(feature = "sandbox")]
-use std::ffi::CString;
-#[cfg(feature = "sandbox")]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(feature = "sandbox")]
-use std::os::unix::process::CommandExt;
 
 use crate::job_control::{
-    set_process_group, set_process_group_explicit, wait_for_process_group, SignalMaskGuard,
-    TerminalGuard, TermiosGuard, WaitOutcome, WaitResult,
+    set_process_group_explicit, wait_for_process_group, SignalMaskGuard, TerminalGuard,
+    TermiosGuard, WaitOutcome, WaitResult,
 };
-use crate::parse::{CommandSpec, SandboxDirective};
+use crate::parse::CommandSpec;
+
+mod redirection;
+mod sandbox;
+mod spawning;
+
+pub use sandbox::{
+    apply_sandbox_directive, sandbox_options_for_command, SandboxBackend, SandboxConfig,
+    SandboxOptions,
+};
+pub use spawning::{
+    build_command, run_command_in_foreground, spawn_command_background, spawn_command_sandboxed,
+    spawn_pipeline_background, spawn_pipeline_sandboxed, wrap_spawn_error,
+};
+
+use sandbox::apply_sandbox;
+use spawning::build_pipeline_command;
 
 pub struct ForegroundResult {
     pub outcome: WaitOutcome,
@@ -35,98 +41,6 @@ pub struct ForegroundResult {
 pub struct CaptureResult {
     pub output: String,
     pub status_code: i32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum SandboxBackend {
-    Bubblewrap,
-    Native,
-}
-
-#[derive(Debug, Clone)]
-pub struct SandboxConfig {
-    pub enabled: bool,
-    pub backend: SandboxBackend,
-    pub bubblewrap_path: Option<String>,
-    pub bubblewrap_args: Vec<String>,
-}
-
-impl Default for SandboxConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            backend: SandboxBackend::Native,
-            bubblewrap_path: None,
-            bubblewrap_args: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-#[cfg_attr(not(feature = "sandbox"), allow(dead_code))]
-pub struct SandboxOptions {
-    pub trace: bool,
-    pub backend: SandboxBackend,
-    pub bubblewrap_path: Option<String>,
-    pub bubblewrap_args: Vec<String>,
-}
-
-impl Default for SandboxOptions {
-    fn default() -> Self {
-        Self {
-            trace: false,
-            backend: SandboxBackend::Native,
-            bubblewrap_path: None,
-            bubblewrap_args: Vec::new(),
-        }
-    }
-}
-
-pub fn apply_sandbox_directive(sandbox: &mut SandboxConfig, directive: SandboxDirective) {
-    match directive {
-        SandboxDirective::Enable => sandbox.enabled = true,
-        SandboxDirective::Disable => sandbox.enabled = false,
-        SandboxDirective::Bubblewrap => {
-            sandbox.enabled = true;
-            sandbox.backend = SandboxBackend::Bubblewrap;
-        }
-        SandboxDirective::Native => {
-            sandbox.enabled = true;
-            sandbox.backend = SandboxBackend::Native;
-        }
-    }
-}
-
-pub fn sandbox_options_for_command(
-    cmd: &CommandSpec,
-    sandbox: &SandboxConfig,
-    trace: bool,
-) -> Option<SandboxOptions> {
-    let mut enabled = sandbox.enabled;
-    let mut backend = sandbox.backend;
-    if let Some(directive) = cmd.sandbox {
-        match directive {
-            SandboxDirective::Enable => enabled = true,
-            SandboxDirective::Disable => enabled = false,
-            SandboxDirective::Bubblewrap => {
-                enabled = true;
-                backend = SandboxBackend::Bubblewrap;
-            }
-            SandboxDirective::Native => {
-                enabled = true;
-                backend = SandboxBackend::Native;
-            }
-        }
-    }
-    if !enabled {
-        return None;
-    }
-    Some(SandboxOptions {
-        trace,
-        backend,
-        bubblewrap_path: sandbox.bubblewrap_path.clone(),
-        bubblewrap_args: sandbox.bubblewrap_args.clone(),
-    })
 }
 
 pub fn run_pipeline_capture(
@@ -143,36 +57,8 @@ pub fn run_pipeline_capture(
     let mut last_pid: Option<i32> = None;
 
     for (idx, cmd) in pipeline.iter().enumerate() {
-        let mut command = Command::new(&cmd.args[0]);
-        command.args(&cmd.args[1..]);
-
-        if let Some(stdout) = prev_stdout.take() {
-            if cmd.stdin.is_none() && cmd.heredoc.is_none() && cmd.herestring.is_none() {
-                command.stdin(Stdio::from(stdout));
-            }
-        }
-
-        apply_input_redirection(&mut command, cmd)?;
-
         let last = idx + 1 == pipeline.len();
-        if last {
-            if cmd.stdout.is_none() {
-                command.stdout(Stdio::piped());
-            } else if let Some(ref output) = cmd.stdout {
-                let mut opts = OpenOptions::new();
-                opts.write(true).create(true);
-                if output.append {
-                    opts.append(true);
-                } else {
-                    opts.truncate(true);
-                }
-                let file = opts.open(&output.path)?;
-                command.stdout(Stdio::from(file));
-            }
-        } else {
-            command.stdout(Stdio::piped());
-        }
-        apply_stderr_redirection(&mut command, cmd)?;
+        let mut command = build_pipeline_command(cmd, prev_stdout.take(), last, true)?;
 
         if let Some(id) = pgid {
             set_process_group_explicit(&mut command, id);
@@ -250,31 +136,8 @@ pub fn run_pipeline(
     let mut handoff_guard: Option<SignalMaskGuard> = None;
 
     for (idx, cmd) in pipeline.iter().enumerate() {
-        let mut command = Command::new(&cmd.args[0]);
-        command.args(&cmd.args[1..]);
-
-        if let Some(stdout) = prev_stdout.take() {
-            if cmd.stdin.is_none() && cmd.heredoc.is_none() && cmd.herestring.is_none() {
-                command.stdin(Stdio::from(stdout));
-            }
-        }
-
-        apply_input_redirection(&mut command, cmd)?;
-
-        if idx + 1 < pipeline.len() {
-            command.stdout(Stdio::piped());
-        } else if let Some(ref output) = cmd.stdout {
-            let mut opts = OpenOptions::new();
-            opts.write(true).create(true);
-            if output.append {
-                opts.append(true);
-            } else {
-                opts.truncate(true);
-            }
-            let file = opts.open(&output.path)?;
-            command.stdout(Stdio::from(file));
-        }
-        apply_stderr_redirection(&mut command, cmd)?;
+        let last = idx + 1 == pipeline.len();
+        let mut command = build_pipeline_command(cmd, prev_stdout.take(), last, false)?;
 
         if let Some(id) = pgid {
             set_process_group_explicit(&mut command, id);
@@ -299,6 +162,8 @@ pub fn run_pipeline(
             pgid.unwrap_or(child.id() as i32)
         );
         if pgid.is_none() {
+            // Block SIGINT/SIGCHLD until the process group is established.
+            // Block SIGCHLD during process-group handoff to avoid races.
             handoff_guard = Some(SignalMaskGuard::new()?);
             let id = child.id() as i32;
             pgid = Some(id);
@@ -340,434 +205,6 @@ pub fn run_pipeline(
     })
 }
 
-pub fn spawn_pipeline_background(
-    pipeline: &[CommandSpec],
-    trace: bool,
-    sandbox: &SandboxConfig,
-) -> io::Result<(i32, i32)> {
-    let mut prev_stdout = None;
-    let mut pgid: Option<i32> = None;
-    let mut last_pid: Option<i32> = None;
-
-    for (idx, cmd) in pipeline.iter().enumerate() {
-        let mut command = Command::new(&cmd.args[0]);
-        command.args(&cmd.args[1..]);
-
-        if let Some(stdout) = prev_stdout.take() {
-            if cmd.stdin.is_none() && cmd.heredoc.is_none() && cmd.herestring.is_none() {
-                command.stdin(Stdio::from(stdout));
-            }
-        }
-
-        apply_input_redirection(&mut command, cmd)?;
-
-        if idx + 1 < pipeline.len() {
-            command.stdout(Stdio::piped());
-        } else if let Some(ref output) = cmd.stdout {
-            let mut opts = OpenOptions::new();
-            opts.write(true).create(true);
-            if output.append {
-                opts.append(true);
-            } else {
-                opts.truncate(true);
-            }
-            let file = opts.open(&output.path)?;
-            command.stdout(Stdio::from(file));
-        }
-        apply_stderr_redirection(&mut command, cmd)?;
-
-        if let Some(id) = pgid {
-            set_process_group_explicit(&mut command, id);
-        } else {
-            set_process_group_explicit(&mut command, 0);
-        }
-        if let Some(options) = sandbox_options_for_command(cmd, sandbox, trace) {
-            apply_sandbox(&mut command, &options)?;
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|err| wrap_spawn_error(&cmd.args[0], err))?;
-        if trace {
-            let pid = child.id();
-            let pgid = pgid.unwrap_or(pid as i32);
-            eprintln!("trace: spawn bg pid {pid} pgid {pgid}");
-        }
-        debug!(
-            "job event=spawn kind=background idx={} pid={} pgid={}",
-            idx,
-            child.id(),
-            pgid.unwrap_or(child.id() as i32)
-        );
-        if pgid.is_none() {
-            pgid = Some(child.id() as i32);
-        }
-        if idx + 1 == pipeline.len() {
-            last_pid = Some(child.id() as i32);
-        }
-        prev_stdout = child.stdout.take();
-    }
-
-    Ok((pgid.unwrap_or(0), last_pid.unwrap_or(0)))
-}
-
-#[cfg_attr(not(feature = "sandbox"), allow(dead_code))]
-pub fn spawn_pipeline_sandboxed(
-    pipeline: &[CommandSpec],
-    options: SandboxOptions,
-) -> io::Result<(i32, i32)> {
-    let mut prev_stdout = None;
-    let mut pgid: Option<i32> = None;
-    let mut last_pid: Option<i32> = None;
-
-    for (idx, cmd) in pipeline.iter().enumerate() {
-        let mut command = Command::new(&cmd.args[0]);
-        command.args(&cmd.args[1..]);
-
-        if let Some(stdout) = prev_stdout.take() {
-            if cmd.stdin.is_none() && cmd.heredoc.is_none() && cmd.herestring.is_none() {
-                command.stdin(Stdio::from(stdout));
-            }
-        }
-
-        apply_input_redirection(&mut command, cmd)?;
-
-        if idx + 1 < pipeline.len() {
-            command.stdout(Stdio::piped());
-        } else if let Some(ref output) = cmd.stdout {
-            let mut opts = OpenOptions::new();
-            opts.write(true).create(true);
-            if output.append {
-                opts.append(true);
-            } else {
-                opts.truncate(true);
-            }
-            let file = opts.open(&output.path)?;
-            command.stdout(Stdio::from(file));
-        }
-        apply_stderr_redirection(&mut command, cmd)?;
-
-        if let Some(id) = pgid {
-            set_process_group_explicit(&mut command, id);
-        } else {
-            set_process_group_explicit(&mut command, 0);
-        }
-
-        apply_sandbox(&mut command, &options)?;
-        let mut child = command
-            .spawn()
-            .map_err(|err| wrap_spawn_error(&cmd.args[0], err))?;
-        if options.trace {
-            let pid = child.id();
-            let pgid = pgid.unwrap_or(pid as i32);
-            eprintln!("trace: spawn sandboxed bg pid {pid} pgid {pgid}");
-        }
-        debug!(
-            "job event=spawn kind=sandboxed-background idx={} pid={} pgid={}",
-            idx,
-            child.id(),
-            pgid.unwrap_or(child.id() as i32)
-        );
-        if pgid.is_none() {
-            pgid = Some(child.id() as i32);
-        }
-        if idx + 1 == pipeline.len() {
-            last_pid = Some(child.id() as i32);
-        }
-        prev_stdout = child.stdout.take();
-    }
-
-    Ok((pgid.unwrap_or(0), last_pid.unwrap_or(0)))
-}
-
-pub fn run_command_in_foreground(
-    command: &mut Command,
-    fg_pgid: &Arc<AtomicI32>,
-    shell_pgid: i32,
-    trace: bool,
-    sandbox: Option<SandboxOptions>,
-) -> io::Result<ForegroundResult> {
-    set_process_group(command, fg_pgid);
-    let handoff_guard = SignalMaskGuard::new()?;
-    if let Some(options) = sandbox {
-        apply_sandbox(command, &options)?;
-    }
-    let child = command
-        .spawn()
-        .map_err(|err| wrap_spawn_error(&command.get_program().to_string_lossy(), err))?;
-    if trace {
-        let pid = child.id();
-        eprintln!("trace: spawn pid {pid} pgid {pid}");
-    }
-    debug!(
-        "job event=spawn kind=single pid={} pgid={}",
-        child.id(),
-        child.id()
-    );
-    let pgid = child.id() as i32;
-    fg_pgid.store(pgid, Ordering::SeqCst);
-    let _termios_guard = TermiosGuard::new();
-    let mut tty_guard = TerminalGuard::new(shell_pgid);
-    tty_guard.set_foreground(pgid)?;
-    drop(handoff_guard);
-    let outcome = wait_for_process_group(pgid, 1, pgid)?;
-    fg_pgid.store(0, Ordering::SeqCst);
-    Ok(ForegroundResult {
-        outcome: outcome.outcome,
-        status_code: outcome.status_code,
-        pipefail_status: outcome.pipefail_status,
-        pgid,
-        last_pid: pgid,
-    })
-}
-
-pub fn spawn_command_background(
-    command: &mut Command,
-    trace: bool,
-    sandbox: Option<SandboxOptions>,
-) -> io::Result<(i32, i32)> {
-    let job_pgid = Arc::new(AtomicI32::new(0));
-    set_process_group(command, &job_pgid);
-    if let Some(options) = sandbox {
-        apply_sandbox(command, &options)?;
-    }
-    let child = command
-        .spawn()
-        .map_err(|err| wrap_spawn_error(&command.get_program().to_string_lossy(), err))?;
-    if trace {
-        let pid = child.id();
-        eprintln!("trace: spawn bg pid {pid} pgid {pid}");
-    }
-    debug!(
-        "job event=spawn kind=background-single pid={} pgid={}",
-        child.id(),
-        child.id()
-    );
-    job_pgid.store(child.id() as i32, Ordering::SeqCst);
-    Ok((job_pgid.load(Ordering::SeqCst), child.id() as i32))
-}
-
-#[cfg_attr(not(feature = "sandbox"), allow(dead_code))]
-pub fn spawn_command_sandboxed(
-    command: &mut Command,
-    options: SandboxOptions,
-) -> io::Result<(i32, i32)> {
-    let job_pgid = Arc::new(AtomicI32::new(0));
-    set_process_group(command, &job_pgid);
-    apply_sandbox(command, &options)?;
-    let child = command
-        .spawn()
-        .map_err(|err| wrap_spawn_error(&command.get_program().to_string_lossy(), err))?;
-    if options.trace {
-        let pid = child.id();
-        eprintln!("trace: spawn sandboxed bg pid {pid} pgid {pid}");
-    }
-    debug!(
-        "job event=spawn kind=sandboxed-background-single pid={} pgid={}",
-        child.id(),
-        child.id()
-    );
-    job_pgid.store(child.id() as i32, Ordering::SeqCst);
-    Ok((job_pgid.load(Ordering::SeqCst), child.id() as i32))
-}
-
-pub fn build_command(cmd: &CommandSpec) -> io::Result<Command> {
-    let mut command = Command::new(&cmd.args[0]);
-    command.args(&cmd.args[1..]);
-
-    apply_input_redirection(&mut command, cmd)?;
-    if let Some(ref output) = cmd.stdout {
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true);
-        if output.append {
-            opts.append(true);
-        } else {
-            opts.truncate(true);
-        }
-        let file = opts.open(&output.path)?;
-        command.stdout(Stdio::from(file));
-    }
-    apply_stderr_redirection(&mut command, cmd)?;
-
-    Ok(command)
-}
-
-pub fn apply_input_redirection(command: &mut Command, cmd: &CommandSpec) -> io::Result<()> {
-    if input_redirection_count(cmd) > 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "multiple input redirections",
-        ));
-    }
-    if let Some(ref path) = cmd.stdin {
-        let file = OpenOptions::new().read(true).open(path)?;
-        command.stdin(Stdio::from(file));
-    }
-    if let Some(ref heredoc) = cmd.heredoc {
-        let Some(ref content) = heredoc.content else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "heredoc not supported here",
-            ));
-        };
-        command.stdin(heredoc_stdin(content)?);
-    }
-    if let Some(ref content) = cmd.herestring {
-        command.stdin(here_string_stdin(content)?);
-    }
-    Ok(())
-}
-
-fn heredoc_stdin(content: &str) -> io::Result<Stdio> {
-    let (read_fd, write_fd) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
-    let bytes = content.as_bytes();
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let written =
-            write(&write_fd, &bytes[offset..]).map_err(|err| io::Error::other(err.to_string()))?;
-        if written == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "heredoc write returned 0",
-            ));
-        }
-        offset += written;
-    }
-    drop(write_fd);
-    let file = unsafe { fs::File::from_raw_fd(read_fd.into_raw_fd()) };
-    Ok(Stdio::from(file))
-}
-
-fn here_string_stdin(content: &str) -> io::Result<Stdio> {
-    let mut buf = String::from(content);
-    buf.push('\n');
-    heredoc_stdin(&buf)
-}
-
-fn input_redirection_count(cmd: &CommandSpec) -> usize {
-    let mut count = 0usize;
-    if cmd.stdin.is_some() {
-        count += 1;
-    }
-    if cmd.heredoc.is_some() {
-        count += 1;
-    }
-    if cmd.herestring.is_some() {
-        count += 1;
-    }
-    count
-}
-
-fn apply_stderr_redirection(command: &mut Command, cmd: &CommandSpec) -> io::Result<()> {
-    if cmd.stderr_close {
-        unsafe {
-            command.pre_exec(|| {
-                close(2).map_err(|err| io::Error::other(err.to_string()))?;
-                Ok(())
-            });
-        }
-        return Ok(());
-    }
-
-    if cmd.stderr_to_stdout {
-        unsafe {
-            command.pre_exec(|| {
-                dup2(1, 2).map_err(|err| io::Error::other(err.to_string()))?;
-                Ok(())
-            });
-        }
-        return Ok(());
-    }
-
-    if let Some(ref err) = cmd.stderr {
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true);
-        if err.append {
-            opts.append(true);
-        } else {
-            opts.truncate(true);
-        }
-        let file = opts.open(&err.path)?;
-        command.stderr(Stdio::from(file));
-    }
-    Ok(())
-}
-fn apply_sandbox(command: &mut Command, options: &SandboxOptions) -> io::Result<()> {
-    #[cfg(feature = "sandbox")]
-    {
-        match options.backend {
-            SandboxBackend::Bubblewrap => {
-                let program = command.get_program().to_os_string();
-                let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
-                let bwrap_path = options
-                    .bubblewrap_path
-                    .unwrap_or_else(|| "bwrap".to_string());
-                let bwrap_path_os = std::ffi::OsString::from(bwrap_path);
-                let mut bwrap_args = options
-                    .bubblewrap_args
-                    .into_iter()
-                    .map(|arg| arg.into())
-                    .collect::<Vec<_>>();
-                bwrap_args.push("--".into());
-                bwrap_args.push(program);
-                bwrap_args.extend(args);
-                unsafe {
-                    command.pre_exec(move || {
-                        execvp_os(&bwrap_path_os, &bwrap_args).map_err(|err| {
-                            io::Error::new(err.kind(), format!("bwrap exec failed: {err}"))
-                        })
-                    });
-                }
-                Ok(())
-            }
-            SandboxBackend::Native => {
-                let program = command.get_program().to_os_string();
-                let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
-                unsafe {
-                    command.pre_exec(move || native_sandbox_exec(&program, &args));
-                }
-                Ok(())
-            }
-        }
-    }
-    #[cfg(not(feature = "sandbox"))]
-    {
-        let _ = (command, options);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "sandbox feature disabled",
-        ))
-    }
-}
-
-#[cfg(feature = "sandbox")]
-fn execvp_os(program: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> io::Result<()> {
-    let prog_c = CString::new(program.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "program contains null"))?;
-    let mut argv = Vec::with_capacity(args.len() + 1);
-    argv.push(prog_c.clone());
-    for arg in args {
-        let cstr = CString::new(arg.as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "argument contains null"))?;
-        argv.push(cstr);
-    }
-    nix::unistd::execvp(&prog_c, &argv).map_err(|err| io::Error::other(err.to_string()))?;
-    Ok(())
-}
-
-#[cfg(feature = "sandbox")]
-fn native_sandbox_exec(
-    program: &std::ffi::OsString,
-    args: &[std::ffi::OsString],
-) -> io::Result<()> {
-    // Placeholder for advanced native sandbox setup.
-    execvp_os(program, args)
-}
-
-pub fn wrap_spawn_error(cmd: &str, err: io::Error) -> io::Error {
-    let (message, kind) = spawn_error_message(cmd, &err);
-    io::Error::new(kind, message)
-}
-
 pub fn status_from_error(err: &io::Error) -> i32 {
     match err.kind() {
         io::ErrorKind::NotFound => 127,
@@ -786,7 +223,7 @@ pub fn exit_status_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-fn spawn_error_message(cmd: &str, err: &io::Error) -> (String, io::ErrorKind) {
+pub(crate) fn spawn_error_message(cmd: &str, err: &io::Error) -> (String, io::ErrorKind) {
     match err.kind() {
         io::ErrorKind::NotFound => (format!("{cmd}: command not found"), io::ErrorKind::NotFound),
         io::ErrorKind::PermissionDenied => (
@@ -806,88 +243,5 @@ fn spawn_error_message(cmd: &str, err: &io::Error) -> (String, io::ErrorKind) {
             }
             (format!("{cmd}: {err}"), err.kind())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parse::HeredocSpec;
-    use tempfile::tempdir;
-
-    fn run_cat_with_spec(spec: CommandSpec) -> io::Result<String> {
-        let mut command = build_command(&spec)?;
-        command.stdout(Stdio::piped());
-        let child = command.spawn()?;
-        let output = child.wait_with_output()?;
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-
-    #[test]
-    fn apply_input_redirection_reads_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("input.txt");
-        fs::write(&path, "hello").unwrap();
-
-        let mut spec = CommandSpec::new();
-        spec.args = vec!["cat".to_string()];
-        spec.stdin = Some(path.display().to_string());
-
-        match run_cat_with_spec(spec) {
-            Ok(output) => assert_eq!(output, "hello"),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                eprintln!("cat not found; skipping test");
-            }
-            Err(err) => panic!("unexpected error: {err}"),
-        }
-    }
-
-    #[test]
-    fn heredoc_pipes_content() {
-        let mut spec = CommandSpec::new();
-        spec.args = vec!["cat".to_string()];
-        spec.heredoc = Some(HeredocSpec {
-            delimiter: "EOF".to_string(),
-            quoted: false,
-            content: Some("line1\nline2\n".to_string()),
-        });
-
-        match run_cat_with_spec(spec) {
-            Ok(output) => assert_eq!(output, "line1\nline2\n"),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                eprintln!("cat not found; skipping test");
-            }
-            Err(err) => panic!("unexpected error: {err}"),
-        }
-    }
-
-    #[test]
-    fn here_string_pipes_content() {
-        let mut spec = CommandSpec::new();
-        spec.args = vec!["cat".to_string()];
-        spec.herestring = Some("line1".to_string());
-
-        match run_cat_with_spec(spec) {
-            Ok(output) => assert_eq!(output, "line1\n"),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                eprintln!("cat not found; skipping test");
-            }
-            Err(err) => panic!("unexpected error: {err}"),
-        }
-    }
-
-    #[test]
-    fn multiple_input_redirections_error() {
-        let mut spec = CommandSpec::new();
-        spec.args = vec!["cat".to_string()];
-        spec.stdin = Some("in.txt".to_string());
-        spec.heredoc = Some(HeredocSpec {
-            delimiter: "EOF".to_string(),
-            quoted: false,
-            content: Some("data".to_string()),
-        });
-        let mut command = Command::new("cat");
-        let err = apply_input_redirection(&mut command, &spec).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::env;
-use std::fs;
 
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
@@ -22,8 +20,16 @@ use std::cell::RefCell;
 
 use crate::colors::{resolve_color, ColorConfig};
 use crate::completions::{completion_candidates, CompletionSet};
-use crate::job_control::Job;
-use crate::parse::{parse_line, OPERATOR_TOKEN_MARKER};
+
+mod matching;
+mod suggestions;
+
+pub use suggestions::update_completion_context;
+
+use crate::completion::matching::best_suggestion;
+use crate::completion::suggestions::{
+    command_for_position, complete_from_list, current_token, is_command_position,
+};
 pub struct SyntaxHighlighter {
     bracket_highlighter: MatchingBracketHighlighter,
     ts_highlighter: RefCell<TSHighlighter>,
@@ -275,198 +281,6 @@ impl Hinter for HistoryAutosuggest {
         }
         Some(remainder)
     }
-}
-
-pub fn update_completion_context(
-    editor: &mut Editor<LineHelper, DefaultHistory>,
-    aliases: &HashMap<String, Vec<String>>,
-    functions: &HashMap<String, Vec<String>>,
-    abbreviations: &HashMap<String, Vec<String>>,
-    completions: &CompletionSet,
-    colors: &ColorConfig,
-    jobs: &[Job],
-) {
-    let commands = collect_commands(aliases, functions, abbreviations);
-    let vars = env::vars().map(|(k, _)| k).collect();
-    let jobs = jobs.iter().map(|job| job.id.to_string()).collect();
-    if let Some(helper) = editor.helper_mut() {
-        helper.update_context(
-            commands,
-            vars,
-            jobs,
-            abbreviations.clone(),
-            completions.clone(),
-            colors,
-        );
-    }
-}
-
-fn collect_commands(
-    aliases: &HashMap<String, Vec<String>>,
-    functions: &HashMap<String, Vec<String>>,
-    abbreviations: &HashMap<String, Vec<String>>,
-) -> Vec<String> {
-    let mut entries = Vec::new();
-    entries.extend(
-        [
-            "cd", "pwd", "jobs", "fg", "bg", "help", "exit", "set", "abbr", "complete",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
-    entries.extend(aliases.keys().cloned());
-    entries.extend(functions.keys().cloned());
-    entries.extend(abbreviations.keys().cloned());
-    if let Ok(path) = env::var("PATH") {
-        for dir in path.split(':') {
-            if let Ok(read) = fs::read_dir(dir) {
-                for entry in read.flatten() {
-                    if let Ok(name) = entry.file_name().into_string() {
-                        entries.push(name);
-                    }
-                }
-            }
-        }
-    }
-    entries.sort();
-    entries.dedup();
-    entries
-}
-
-fn current_token(line: &str, pos: usize) -> (usize, String) {
-    let mut start = pos;
-    let bytes = line.as_bytes();
-    while start > 0 {
-        let ch = bytes[start - 1] as char;
-        if ch.is_whitespace() || is_operator_char(ch) {
-            break;
-        }
-        start -= 1;
-    }
-    (start, line[start..pos].to_string())
-}
-
-fn is_operator_char(ch: char) -> bool {
-    matches!(ch, '|' | '&' | ';' | '(' | ')' | '{' | '}')
-}
-
-fn is_command_position(line: &str, start: usize) -> bool {
-    if start == 0 {
-        return true;
-    }
-    let prefix = line[..start].trim_end();
-    if prefix.is_empty() {
-        return true;
-    }
-    if let Some(ch) = prefix.chars().last() {
-        return is_operator_char(ch);
-    }
-    false
-}
-
-fn complete_from_list(prefix: &str, list: &[String], leader: &str) -> Vec<Pair> {
-    let mut out = Vec::new();
-    for item in list {
-        if item.starts_with(prefix) {
-            out.push(Pair {
-                display: format!("{leader}{item}"),
-                replacement: format!("{leader}{item}"),
-            });
-        }
-    }
-    out
-}
-
-fn best_suggestion(token: &str, candidates: &[String]) -> Option<String> {
-    let mut best_prefix: Option<&String> = None;
-    for candidate in candidates {
-        if candidate.starts_with(token) {
-            best_prefix = match best_prefix {
-                Some(current) if current.len() <= candidate.len() => Some(current),
-                _ => Some(candidate),
-            };
-        }
-    }
-    if let Some(candidate) = best_prefix {
-        return Some(candidate.clone());
-    }
-    let mut best = None;
-    let mut best_dist = usize::MAX;
-    for candidate in candidates {
-        if candidate.is_empty() {
-            continue;
-        }
-        let dist = edit_distance(token, candidate, 2);
-        if dist <= 2 && dist < best_dist {
-            best_dist = dist;
-            best = Some(candidate.clone());
-        }
-    }
-    best
-}
-
-fn edit_distance(a: &str, b: &str, max: usize) -> usize {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let alen = a_bytes.len();
-    let blen = b_bytes.len();
-    if alen == 0 {
-        return blen;
-    }
-    if blen == 0 {
-        return alen;
-    }
-    let mut prev: Vec<usize> = (0..=blen).collect();
-    let mut cur = vec![0; blen + 1];
-    for i in 1..=alen {
-        cur[0] = i;
-        let mut row_min = cur[0];
-        for j in 1..=blen {
-            let cost = if a_bytes[i - 1] == b_bytes[j - 1] {
-                0
-            } else {
-                1
-            };
-            let insert = cur[j - 1] + 1;
-            let delete = prev[j] + 1;
-            let replace = prev[j - 1] + cost;
-            let value = insert.min(delete).min(replace);
-            cur[j] = value;
-            if value < row_min {
-                row_min = value;
-            }
-        }
-        if row_min > max {
-            return row_min;
-        }
-        prev.clone_from(&cur);
-    }
-    prev[blen]
-}
-
-fn command_for_position(line: &str, pos: usize) -> Option<String> {
-    let prefix = &line[..pos];
-    let tokens = parse_line(prefix).ok()?;
-    let mut in_command = true;
-    let mut command = None;
-    for token in tokens {
-        if token.starts_with(OPERATOR_TOKEN_MARKER) {
-            if is_command_delimiter(&token) {
-                in_command = true;
-            }
-            continue;
-        }
-        if in_command {
-            command = Some(token);
-            in_command = false;
-        }
-    }
-    command
-}
-
-fn is_command_delimiter(token: &str) -> bool {
-    let op = token.trim_start_matches(OPERATOR_TOKEN_MARKER);
-    matches!(op, "|" | "||" | "&&" | ";" | "&")
 }
 
 impl Helper for LineHelper {}
